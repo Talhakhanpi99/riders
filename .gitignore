@@ -1,0 +1,15 @@
+﻿__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+logs/*.log
+database/*.db
+.buildozer/
+bin/
+*.apk
+*.aab
+.env
+venv-broken/
+
