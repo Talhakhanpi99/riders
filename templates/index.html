@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VoiceRide</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <nav class="top-bar" aria-label="Primary">
+        <div>
+          <p class="eyebrow">Offline assistant</p>
+          <h1>VoiceRide</h1>
+        </div>
+        <div class="nav-actions">
+          <a href="/settings" aria-label="Settings">Settings</a>
+          <a href="/logs" aria-label="Logs">Logs</a>
+        </div>
+      </nav>
+
+      <section class="control-panel" aria-label="Voice assistant control">
+        <div class="status-ring" id="statusRing">
+          <span id="statusText">Ready</span>
+        </div>
+        <button class="primary-action" id="listenButton" type="button">Start Listening</button>
+        <label class="command-input">
+          <span>Manual command</span>
+          <input id="commandInput" type="text" placeholder="Phone call Shani">
+        </label>
+        <button class="secondary-action" id="sendButton" type="button">Run Command</button>
+      </section>
+
+      <section class="response-panel" aria-live="polite">
+        <h2>Assistant</h2>
+        <p id="assistantResponse">Say "Phone" followed by a natural command.</p>
+      </section>
+
+      <section class="quick-grid" aria-label="Quick commands">
+        <button data-command="battery percentage">Battery</button>
+        <button data-command="open camera">Camera</button>
+        <button data-command="increase volume">Volume Up</button>
+        <button data-command="open torch">Torch</button>
+      </section>
+    </main>
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>
