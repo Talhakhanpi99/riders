@@ -48,6 +48,11 @@ class AndroidNativeBridge:
         self.logger = logger
         self._activity: Any | None = None
         self._autoclass: Any | None = None
+        self._speech_recognizer: Any | None = None
+        self._speech_listener: Any | None = None
+        self._speech_result: str | None = None
+        self._speech_error: str | None = None
+        self._speech_lock = threading.Lock()
         try:
             from jnius import autoclass  # type: ignore
 
@@ -235,6 +240,77 @@ class AndroidNativeBridge:
             return f"No unread notifications for {package_name}."
         return "You have no unread notifications."
 
+    def start_listening(self, timeout_seconds: int = 5) -> dict[str, Any]:
+        """Run one short Android recognition session; the microphone is not kept open."""
+        if not self.android_available:
+            return {"started": False, "status": "unavailable", "message": "Speech recognition is available on Android only."}
+        try:
+            from android.permissions import Permission, request_permissions  # type: ignore
+            from android.runnable import run_on_ui_thread  # type: ignore
+            from jnius import PythonJavaClass, java_method  # type: ignore
+            request_permissions([Permission.RECORD_AUDIO])
+            bridge = self
+            class Listener(PythonJavaClass):
+                __javainterfaces__ = ["android/speech/RecognitionListener"]
+                __javacontext__ = "app"
+                @java_method("(Landroid/os/Bundle;)V")
+                def onReadyForSpeech(self, _value: Any) -> None: pass
+                @java_method("()V")
+                def onBeginningOfSpeech(self) -> None: pass
+                @java_method("(F)V")
+                def onRmsChanged(self, _value: float) -> None: pass
+                @java_method("([B)V")
+                def onBufferReceived(self, _value: Any) -> None: pass
+                @java_method("()V")
+                def onEndOfSpeech(self) -> None: pass
+                @java_method("(I)V")
+                def onError(self, code: int) -> None:
+                    with bridge._speech_lock:
+                        bridge._speech_error = "No speech was recognised. Please try again." if code == 7 else f"Speech recognition stopped (error {code})."
+                @java_method("(Landroid/os/Bundle;)V")
+                def onResults(self, bundle: Any) -> None:
+                    recognizer = bridge._class("android.speech.SpeechRecognizer")
+                    values = bundle.getStringArrayList(recognizer.RESULTS_RECOGNITION)
+                    with bridge._speech_lock:
+                        bridge._speech_result = str(values.get(0)).strip() if values and values.size() else ""
+                @java_method("(Landroid/os/Bundle;)V")
+                def onPartialResults(self, _value: Any) -> None: pass
+                @java_method("(ILandroid/os/Bundle;)V")
+                def onEvent(self, _event: int, _value: Any) -> None: pass
+            @run_on_ui_thread
+            def begin() -> None:
+                SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
+                RecognizerIntent = self._class("android.speech.RecognizerIntent")
+                if not SpeechRecognizer.isRecognitionAvailable(self._activity):
+                    with self._speech_lock: self._speech_error = "Speech recognition is not available on this phone."
+                    return
+                if self._speech_recognizer is not None: self._speech_recognizer.destroy()
+                self._speech_listener = Listener()
+                self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
+                self._speech_recognizer.setRecognitionListener(self._speech_listener)
+                intent = RecognizerIntent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, max(2, min(15, timeout_seconds)) * 1000)
+                self._speech_recognizer.startListening(intent)
+            with self._speech_lock: self._speech_result, self._speech_error = None, None
+            begin()
+            return {"started": True, "status": "listening"}
+        except Exception as exc:
+            self.logger.exception("Could not start speech recognition: %s", exc)
+            return {"started": False, "status": "error", "message": "Could not start speech recognition."}
+
+    def consume_speech_result(self) -> dict[str, str]:
+        with self._speech_lock:
+            if self._speech_result is not None:
+                value, self._speech_result = self._speech_result, None
+                return {"status": "result", "transcript": value}
+            if self._speech_error is not None:
+                value, self._speech_error = self._speech_error, None
+                return {"status": "error", "message": value}
+        return {"status": "listening"}
+
+    def open_airplane_mode_settings(self) -> bool:
+        return self._open_settings_panel("android.settings.AIRPLANE_MODE_SETTINGS") if self.android_available else True
     def _class(self, name: str) -> Any:
         if not self._autoclass:
             raise RuntimeError("Android runtime is unavailable")

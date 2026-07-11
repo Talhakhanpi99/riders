@@ -2,37 +2,49 @@ const statusRing = document.querySelector("#statusRing");
 const statusText = document.querySelector("#statusText");
 const responseText = document.querySelector("#assistantResponse");
 const commandInput = document.querySelector("#commandInput");
+let polling = false;
+
+function setState(text, active = false) {
+  statusText.textContent = text;
+  statusRing.classList.toggle("listening", active);
+}
 
 async function runCommand(text, requireWakeWord = false) {
   if (!text) return;
-  statusRing.classList.add("listening");
-  statusText.textContent = "Thinking";
+  setState("Thinking", true);
   try {
-    const response = await fetch("/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, require_wake_word: requireWakeWord }),
-    });
-    if (!response.ok) throw new Error("Command request failed");
+    const response = await fetch("/api/command", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text, require_wake_word: requireWakeWord})});
     const payload = await response.json();
     responseText.textContent = payload.response || "No response received.";
-    statusText.textContent = payload.success ? "Done" : "Ready";
-  } catch (error) {
-    responseText.textContent = "I could not reach the assistant. Please try again.";
-    statusText.textContent = "Offline";
-  } finally {
-    statusRing.classList.remove("listening");
-  }
+    setState(payload.success ? "Done" : "Ready");
+  } catch { responseText.textContent = "I could not reach the assistant."; setState("Offline"); }
+}
+
+async function startListening() {
+  if (polling) return;
+  setState("Listening", true);
+  try {
+    const response = await fetch("/api/listen/start", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({timeout_seconds: 5})});
+    const state = await response.json();
+    if (!state.started) throw new Error(state.message);
+    polling = true;
+    pollForSpeech();
+  } catch (error) { responseText.textContent = error.message || "Microphone could not start."; setState("Ready"); }
+}
+
+async function pollForSpeech() {
+  try {
+    const event = await (await fetch("/api/listen/result")).json();
+    if (event.status === "listening") return setTimeout(pollForSpeech, 400);
+    if (event.status === "wake_detected") { responseText.textContent = event.response; polling = false; setTimeout(startListening, 0); return; }
+    responseText.textContent = event.response || event.message || "No speech was recognised.";
+    if (event.transcript) commandInput.value = event.transcript;
+    setState(event.success ? "Done" : "Ready");
+  } catch { responseText.textContent = "Listening failed. Please try again."; setState("Ready"); }
+  finally { polling = false; }
 }
 
 document.querySelector("#sendButton").addEventListener("click", () => runCommand(commandInput.value.trim()));
-commandInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") runCommand(commandInput.value.trim());
-});
-document.querySelector("#listenButton").addEventListener("click", () => {
-  statusText.textContent = "Listening";
-  commandInput.focus();
-});
-document.querySelectorAll("[data-command]").forEach((button) => {
-  button.addEventListener("click", () => runCommand(button.dataset.command));
-});
+commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter") runCommand(commandInput.value.trim()); });
+document.querySelector("#listenButton").addEventListener("click", startListening);
+document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));

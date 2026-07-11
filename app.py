@@ -329,6 +329,26 @@ def register_routes(
             )
         )
 
+    @flask_app.post("/api/listen/start")
+    def start_listening() -> Any:
+        payload = request.get_json(silent=True) or {}
+        timeout = max(2, min(15, int(payload.get("timeout_seconds", settings_service.get().wake_timeout_seconds))))
+        return jsonify(bridge.start_listening(timeout))
+
+    @flask_app.get("/api/listen/result")
+    def listening_result() -> Any:
+        event = bridge.consume_speech_result()
+        if event["status"] != "result":
+            return jsonify(event)
+        transcript = event.get("transcript", "")
+        user_settings = settings_service.get()
+        woke, remainder = assistant.wake_detector.remove_wake_word(transcript, user_settings.wake_word)
+        if woke and not remainder:
+            bridge.signal_wake(user_settings.wake_feedback_mode)
+            return jsonify({"status": "wake_detected", "transcript": transcript, "response": "I am listening."})
+        result = assistant.handle_text(transcript, require_wake_word=True)
+        result.update({"status": "completed", "transcript": transcript})
+        return jsonify(result)
     @flask_app.get("/api/settings")
     def get_settings() -> Any:
         return jsonify(asdict(settings_service.get()))
