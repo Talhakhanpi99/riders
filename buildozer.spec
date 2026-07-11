@@ -1,4 +1,4 @@
-﻿[app]
+[app]
 title = VoiceRide
 # (bool) Indicate if you want to automatically accept SDK license
 android.accept_sdk_license = True
