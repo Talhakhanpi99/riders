@@ -344,9 +344,11 @@ def register_routes(
         user_settings = settings_service.get()
         woke, remainder = assistant.wake_detector.remove_wake_word(transcript, user_settings.wake_word)
         if woke and not remainder:
+            assistant.arm_follow_up(user_settings.wake_timeout_seconds)
             bridge.signal_wake(user_settings.wake_feedback_mode)
-            return jsonify({"status": "wake_detected", "transcript": transcript, "response": "I am listening."})
-        result = assistant.handle_text(transcript, require_wake_word=True)
+            bridge.speak("Yes, I am here.", user_settings.speech_speed)
+            return jsonify({"status": "wake_detected", "transcript": transcript, "response": "Yes, I am here."})
+        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up())
         result.update({"status": "completed", "transcript": transcript})
         return jsonify(result)
     @flask_app.get("/api/settings")
@@ -398,3 +400,16 @@ def register_routes(
                 }
             }
         )
+    @flask_app.get("/api/diagnostics")
+    def diagnostics() -> Any:
+        permission_state = {
+            key: permission_manager.has_permission(key)
+            for key in permission_manager.PERMISSIONS
+        }
+        return jsonify({
+            "app": "VoiceRide",
+            "android_available": bridge.android_available,
+            "permissions": permission_state,
+            "settings": asdict(settings_service.get()),
+            "recent_commands": history_repository.recent_commands(),
+        })

@@ -9,7 +9,7 @@ async function requestStartupPermissions() {
     await fetch("/api/permissions/request", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({keys: ["microphone", "camera"]}),
+      body: JSON.stringify({keys: ["microphone", "camera", "notifications", "location", "phone", "send_sms", "read_sms", "contacts"]}),
     });
   } catch {
     // Individual actions will ask again if permission was not granted.
@@ -60,4 +60,4 @@ document.querySelector("#sendButton").addEventListener("click", () => runCommand
 commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter") runCommand(commandInput.value.trim()); });
 document.querySelector("#listenButton").addEventListener("click", startListening);
 document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));
-requestStartupPermissions();
+requestStartupPermissions().finally(startListening);

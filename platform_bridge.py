@@ -53,6 +53,7 @@ class AndroidNativeBridge:
         self._speech_listener: Any | None = None
         self._speech_result: str | None = None
         self._speech_error: str | None = None
+        self._tts: Any | None = None
         self._speech_lock = threading.Lock()
         try:
             from jnius import autoclass  # type: ignore
@@ -106,8 +107,24 @@ class AndroidNativeBridge:
             return {permission: self.has_permission(permission) for permission in permissions}
 
     def speak(self, text: str, speech_speed: float = 1.0) -> None:
+        """Speak feedback through Android TextToSpeech; log on desktop."""
         self.logger.info("TTS response: %s | speed=%s", text, speech_speed)
+        if not self.android_available or not text:
+            return
+        try:
+            from android.runnable import run_on_ui_thread  # type: ignore
 
+            @run_on_ui_thread
+            def speak_on_ui_thread() -> None:
+                TextToSpeech = self._class("android.speech.tts.TextToSpeech")
+                if self._tts is None:
+                    self._tts = TextToSpeech(self._activity, None)
+                self._tts.setSpeechRate(max(0.7, min(1.3, speech_speed)))
+                self._tts.speak(text, TextToSpeech.QUEUE_FLUSH, None, "voiceride")
+
+            speak_on_ui_thread()
+        except Exception as exc:
+            self.logger.exception("Android TTS failed: %s", exc)
     def signal_wake(self, mode: str) -> bool:
         if mode == "torch_blink":
             return self._blink_torch()

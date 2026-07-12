@@ -67,6 +67,7 @@ class PermissionManager:
         "notifications": PermissionDescriptor("notifications", "POST_NOTIFICATIONS", "Needed for notification alerts."),
         "camera": PermissionDescriptor("camera", "CAMERA", "Needed to control the torch and camera."),
         "location": PermissionDescriptor("location", "ACCESS_FINE_LOCATION", "Needed for location features."),
+        "contacts": PermissionDescriptor("contacts", "READ_CONTACTS", "Needed to find contacts by name."),
         "phone": PermissionDescriptor("phone", "CALL_PHONE", "Needed to place a call."),
         "send_sms": PermissionDescriptor("send_sms", "SEND_SMS", "Needed to send a text message."),
         "read_sms": PermissionDescriptor("read_sms", "READ_SMS", "Needed to read the latest text message."),
@@ -189,7 +190,15 @@ class AssistantService:
         self.settings_service = settings_service
         self.logger = logger or logging.getLogger("voiceride")
         self.parser, self.wake_detector, self.pending = IntentParser(), WakeWordDetector(default_wake_word), None
+        self._follow_up_until = 0.0
 
+    def arm_follow_up(self, timeout_seconds: int) -> None:
+        self._follow_up_until = time.monotonic() + max(2, min(15, timeout_seconds))
+
+    def consume_follow_up(self) -> bool:
+        active = time.monotonic() <= self._follow_up_until
+        self._follow_up_until = 0.0
+        return active
     def handle_text(self, text: str, require_wake_word: bool = False) -> dict[str, Any]:
         started, settings = time.monotonic(), self.settings_service.get()
         woke, command = self.wake_detector.remove_wake_word(text, settings.wake_word)
