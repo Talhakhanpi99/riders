@@ -34,26 +34,44 @@ async function runCommand(text, requireWakeWord = false) {
 
 async function startListening() {
   if (polling) return;
-  setState("Listening", true);
+  // Set this before the request so a button tap cannot create a second session.
+  polling = true;
+  setState("Starting microphone", true);
   try {
     const response = await fetch("/api/listen/start", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({timeout_seconds: 5})});
     const state = await response.json();
-    if (!state.started) throw new Error(state.message);
-    polling = true;
+    if (!state.started) throw new Error(state.message || "Microphone could not start.");
     pollForSpeech();
-  } catch (error) { responseText.textContent = error.message || "Microphone could not start."; setState("Ready"); }
+  } catch (error) {
+    polling = false;
+    responseText.textContent = error.message || "Microphone could not start.";
+    setState("Ready");
+  }
 }
 
 async function pollForSpeech() {
+  if (!polling) return;
   try {
     const event = await (await fetch("/api/listen/result")).json();
-    if (event.status === "listening") return setTimeout(pollForSpeech, 400);
-    if (event.status === "wake_detected") { responseText.textContent = event.response; polling = false; setTimeout(startListening, 0); return; }
+    if (event.status === "starting" || event.status === "listening") {
+      setState(event.status === "starting" ? "Starting microphone" : "Listening", true);
+      setTimeout(pollForSpeech, 400);
+      return;
+    }
+    if (event.status === "wake_detected") {
+      responseText.textContent = event.response;
+      polling = false;
+      setTimeout(startListening, 150);
+      return;
+    }
     responseText.textContent = event.response || event.message || "No speech was recognised.";
     if (event.transcript) commandInput.value = event.transcript;
     setState(event.success ? "Done" : "Ready");
-  } catch { responseText.textContent = "Listening failed. Please try again."; setState("Ready"); }
-  finally { polling = false; }
+  } catch {
+    responseText.textContent = "Listening failed. Please try again.";
+    setState("Ready");
+  }
+  polling = false;
 }
 
 document.querySelector("#sendButton").addEventListener("click", () => runCommand(commandInput.value.trim()));

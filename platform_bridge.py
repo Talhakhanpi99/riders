@@ -53,6 +53,7 @@ class AndroidNativeBridge:
         self._speech_listener: Any | None = None
         self._speech_result: str | None = None
         self._speech_error: str | None = None
+        self._speech_state = "idle"
         self._tts: Any | None = None
         self._speech_lock = threading.Lock()
         try:
@@ -327,7 +328,10 @@ class AndroidNativeBridge:
                 __javainterfaces__ = ["android/speech/RecognitionListener"]
                 __javacontext__ = "app"
                 @java_method("(Landroid/os/Bundle;)V")
-                def onReadyForSpeech(self, _value: Any) -> None: pass
+                def onReadyForSpeech(self, _value: Any) -> None:
+                    with bridge._speech_lock:
+                        bridge._speech_state = "listening"
+                    bridge.logger.info("Speech recognizer is ready")
                 @java_method("()V")
                 def onBeginningOfSpeech(self) -> None: pass
                 @java_method("(F)V")
@@ -339,13 +343,16 @@ class AndroidNativeBridge:
                 @java_method("(I)V")
                 def onError(self, code: int) -> None:
                     with bridge._speech_lock:
+                        bridge._speech_state = "error"
                         bridge._speech_error = {1: "Speech recognition network error.", 2: "Speech recognition network error.", 3: "Audio recording failed. Check microphone permission.", 5: "Speech recognition is busy. Please try again.", 6: "Speech recognition timed out. Please try again.", 7: "No speech was recognised. Please try again.", 9: "Microphone permission is required to start listening."}.get(code, f"Speech recognition stopped (error {code}).")
                 @java_method("(Landroid/os/Bundle;)V")
                 def onResults(self, bundle: Any) -> None:
                     recognizer = bridge._class("android.speech.SpeechRecognizer")
                     values = bundle.getStringArrayList(recognizer.RESULTS_RECOGNITION)
                     with bridge._speech_lock:
+                        bridge._speech_state = "result"
                         bridge._speech_result = str(values.get(0)).strip() if values and values.size() else ""
+                    bridge.logger.info("Speech recognizer result: %s", bridge._speech_result)
                 @java_method("(Landroid/os/Bundle;)V")
                 def onPartialResults(self, _value: Any) -> None: pass
                 @java_method("(ILandroid/os/Bundle;)V")
@@ -354,8 +361,10 @@ class AndroidNativeBridge:
             def begin() -> None:
                 SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
                 RecognizerIntent = self._class("android.speech.RecognizerIntent")
+                Intent = self._class("android.content.Intent")
                 if not SpeechRecognizer.isRecognitionAvailable(self._activity):
                     with self._speech_lock:
+                        self._speech_state = "error"
                         self._speech_error = "Speech recognition is not available on this phone."
                     return
                 if self._speech_recognizer is not None:
@@ -363,14 +372,23 @@ class AndroidNativeBridge:
                 self._speech_listener = Listener()
                 self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
                 self._speech_recognizer.setRecognitionListener(self._speech_listener)
-                intent = RecognizerIntent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, max(2, min(15, timeout_seconds)) * 1000)
                 self._speech_recognizer.startListening(intent)
             with self._speech_lock:
                 self._speech_result, self._speech_error = None, None
+                self._speech_state = "starting"
             begin()
-            return {"started": True, "status": "listening"}
+            def fail_if_not_ready() -> None:
+                with self._speech_lock:
+                    if self._speech_state != "starting":
+                        return
+                    self._speech_state = "error"
+                    self._speech_error = "Android did not initialize speech recognition. Check the phone speech service and try again."
+                self.logger.error("Speech recognizer never reached onReadyForSpeech")
+            threading.Timer(4.0, fail_if_not_ready).start()
+            return {"started": True, "status": "starting"}
         except Exception as exc:
             self.logger.exception("Could not start speech recognition: %s", exc)
             return {"started": False, "status": "error", "message": "Could not start speech recognition."}
@@ -379,11 +397,13 @@ class AndroidNativeBridge:
         with self._speech_lock:
             if self._speech_result is not None:
                 value, self._speech_result = self._speech_result, None
+                self._speech_state = "idle"
                 return {"status": "result", "transcript": value}
             if self._speech_error is not None:
                 value, self._speech_error = self._speech_error, None
+                self._speech_state = "idle"
                 return {"status": "error", "message": value}
-        return {"status": "listening"}
+            return {"status": self._speech_state}
 
     def open_airplane_mode_settings(self) -> bool:
         return self._open_settings_panel("android.settings.AIRPLANE_MODE_SETTINGS") if self.android_available else True
