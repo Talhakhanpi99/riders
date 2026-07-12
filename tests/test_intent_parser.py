@@ -1,4 +1,4 @@
-from voice_core import IntentParser, IntentType
+from voice_core import ContactMatcher, IntentParser, IntentType, WakeWordDetector
 
 
 def test_parse_roman_urdu_call() -> None:
@@ -51,3 +51,37 @@ def test_short_confirmation_does_not_match_contact_name() -> None:
 
     assert intent.intent_type != IntentType.CONFIRM_ACTION
     assert intent.intent_type != IntentType.BRIGHTNESS_SET
+
+
+def test_parse_roman_urdu_light_and_toggle_variants() -> None:
+    parser = IntentParser()
+
+    assert parser.parse("open light").intent_type == IntentType.FLASHLIGHT_ON
+    assert parser.parse("light band kro").intent_type == IntentType.FLASHLIGHT_OFF
+    assert parser.parse("torch band karo").intent_type == IntentType.FLASHLIGHT_OFF
+    assert parser.parse("open bluetooth").intent_type == IntentType.BLUETOOTH_ON
+
+
+def test_parse_roman_urdu_brightness_variants() -> None:
+    parser = IntentParser()
+
+    assert parser.parse("roshni barhao").intent_type == IntentType.BRIGHTNESS_UP
+    assert parser.parse("brightness kam kro").intent_type == IntentType.BRIGHTNESS_DOWN
+
+
+def test_wake_word_common_recognizer_aliases() -> None:
+    detector = WakeWordDetector()
+
+    assert detector.remove_wake_word("phone open light") == (True, "open light")
+    assert detector.remove_wake_word("full light band kro") == (True, "light band kro")
+
+def test_fuzzy_device_name_and_contact_honorific_are_resolved() -> None:
+    parser = IntentParser()
+    assert parser.parse("open bluetooh").intent_type == IntentType.BLUETOOTH_ON
+
+    contact = ContactMatcher.match(
+        "Shani Bhai",
+        [{"name": "Shani Zong", "phone_number": "+923001234567"}],
+    )
+    assert contact is not None
+    assert contact["name"] == "Shani Zong"

@@ -1,4 +1,4 @@
-"""Flask application, database, settings, routes, and dependency wiring."""
+﻿"""Flask application, database, settings, routes, and dependency wiring."""
 
 from __future__ import annotations
 
@@ -351,6 +351,31 @@ def register_routes(
         result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up())
         result.update({"status": "completed", "transcript": transcript})
         return jsonify(result)
+    @flask_app.post("/api/offline/transcript")
+    def offline_transcript() -> Any:
+        """Receive a final local Vosk transcript from the foreground service."""
+        payload = request.get_json(silent=True) or {}
+        transcript = str(payload.get("transcript", "")).strip()
+        if not transcript:
+            return jsonify({"status": "ignored", "message": "No transcript received."}), 400
+        user_settings = settings_service.get()
+        woke, remainder = assistant.wake_detector.remove_wake_word(transcript, user_settings.wake_word)
+        if woke and not remainder:
+            assistant.arm_follow_up(user_settings.wake_timeout_seconds)
+            bridge.signal_wake(user_settings.wake_feedback_mode)
+            bridge.speak("Yes, I am here.", user_settings.speech_speed)
+            return jsonify({"status": "wake_detected", "transcript": transcript, "response": "Yes, I am here."})
+        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up())
+        result.update({"status": "completed", "transcript": transcript})
+        return jsonify(result)
+
+    @flask_app.post("/api/offline-listener/start")
+    def start_offline_listener() -> Any:
+        return jsonify(bridge.start_offline_listener())
+
+    @flask_app.post("/api/offline-listener/stop")
+    def stop_offline_listener() -> Any:
+        return jsonify(bridge.stop_offline_listener())
     @flask_app.get("/api/settings")
     def get_settings() -> Any:
         return jsonify(asdict(settings_service.get()))

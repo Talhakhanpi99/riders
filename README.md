@@ -19,7 +19,7 @@ The first target use case is Pakistan-style bike riding: the rider says a config
 
 The assistant pipeline is:
 
-`Wake Word -> Speech Recognition -> Intent Detection -> Context Manager -> Action Dispatcher -> Android Native Bridge -> Voice Response`
+`Wake Word -> Offline Vosk / Android Speech Recognition -> Intent Detection -> Context Manager -> Action Dispatcher -> Android Native Bridge -> Voice Response`
 
 Important files:
 
@@ -29,6 +29,7 @@ Important files:
 - `platform_bridge.py`: Android WebView launcher and native API bridge.
 - `templates/` and `static/`: WebView UI.
 - `buildozer.spec` and `.github/workflows/android.yml`: APK build configuration.
+- `offline_listener_service.py`: sticky foreground Vosk listener that returns local final transcripts to the app over `127.0.0.1`.
 - `docs/`: architecture and API documentation.
 
 ## Local Development
@@ -67,6 +68,8 @@ python3 -m pip install -r requirements.txt
 ```
 
 Production signing should use a protected keystore configured in CI secrets before Play Store release.
+
+Version 0.1.4 bundles Vosk's 40 MB small English model. While enabled, it uses roughly 300 MB of memory; start it with **Start Offline Listening** while VoiceRide is visible because Android 12+ limits microphone foreground-service starts from the background. The bundled model is English-focused; use the normal Android listener for better Roman-Urdu recognition.
 
 ## Testing
 

@@ -3,6 +3,7 @@ const statusText = document.querySelector("#statusText");
 const responseText = document.querySelector("#assistantResponse");
 const commandInput = document.querySelector("#commandInput");
 let polling = false;
+let offlineListening = false;
 
 async function requestStartupPermissions() {
   try {
@@ -49,6 +50,19 @@ async function startListening() {
   }
 }
 
+async function toggleOfflineListening() {
+  const endpoint = offlineListening ? "/api/offline-listener/stop" : "/api/offline-listener/start";
+  try {
+    const payload = await (await fetch(endpoint, {method: "POST"})).json();
+    if (!payload.started && !payload.stopped) throw new Error(payload.message || "Offline listener could not be changed.");
+    offlineListening = Boolean(payload.started) && !payload.stopped;
+    document.querySelector("#offlineListenButton").textContent = offlineListening ? "Stop Offline Listening" : "Start Offline Listening";
+    responseText.textContent = payload.message || (offlineListening ? "Offline listening started." : "Offline listening stopped.");
+    setState(offlineListening ? "Offline listening" : "Ready", offlineListening);
+  } catch (error) {
+    responseText.textContent = error.message || "Offline listener could not be changed.";
+  }
+}
 async function pollForSpeech() {
   if (!polling) return;
   try {
@@ -77,5 +91,6 @@ async function pollForSpeech() {
 document.querySelector("#sendButton").addEventListener("click", () => runCommand(commandInput.value.trim()));
 commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter") runCommand(commandInput.value.trim()); });
 document.querySelector("#listenButton").addEventListener("click", startListening);
+document.querySelector("#offlineListenButton").addEventListener("click", toggleOfflineListening);
 document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));
 requestStartupPermissions().finally(startListening);
