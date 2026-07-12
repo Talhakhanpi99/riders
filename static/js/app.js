@@ -4,6 +4,18 @@ const responseText = document.querySelector("#assistantResponse");
 const commandInput = document.querySelector("#commandInput");
 let polling = false;
 
+async function requestStartupPermissions() {
+  try {
+    await fetch("/api/permissions/request", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({keys: ["microphone", "camera"]}),
+    });
+  } catch {
+    // Individual actions will ask again if permission was not granted.
+  }
+}
+
 function setState(text, active = false) {
   statusText.textContent = text;
   statusRing.classList.toggle("listening", active);
@@ -48,3 +60,4 @@ document.querySelector("#sendButton").addEventListener("click", () => runCommand
 commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter") runCommand(commandInput.value.trim()); });
 document.querySelector("#listenButton").addEventListener("click", startListening);
 document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));
+requestStartupPermissions();

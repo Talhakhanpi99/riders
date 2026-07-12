@@ -375,3 +375,26 @@ def register_routes(
                 for descriptor in permission_manager.PERMISSIONS.values()
             ]
         )
+
+    @flask_app.post("/api/permissions/request")
+    def request_runtime_permissions() -> Any:
+        """Ask Android for the permissions used by the visible app controls."""
+        payload = request.get_json(silent=True) or {}
+        requested_keys = payload.get("keys", ["microphone", "camera"])
+        if not isinstance(requested_keys, list):
+            requested_keys = ["microphone", "camera"]
+        permissions = [
+            f"android.permission.{permission_manager.PERMISSIONS[key].android_name}"
+            for key in requested_keys
+            if key in permission_manager.PERMISSIONS
+        ]
+        grants = bridge.request_permissions(permissions)
+        return jsonify(
+            {
+                "granted": {
+                    key: grants.get(f"android.permission.{descriptor.android_name}", False)
+                    for key, descriptor in permission_manager.PERMISSIONS.items()
+                    if key in requested_keys
+                }
+            }
+        )

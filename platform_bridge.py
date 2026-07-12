@@ -15,8 +15,9 @@ def launch_webview_if_available(url: str) -> None:
     """
 
     try:
-        from android.runnable import run_on_ui_thread  # type: ignore
         from jnius import autoclass  # type: ignore
+
+        from android.runnable import run_on_ui_thread  # type: ignore
     except Exception:
         return
 
@@ -66,6 +67,44 @@ class AndroidNativeBridge:
     def android_available(self) -> bool:
         return self._activity is not None and self._autoclass is not None
 
+    def has_permission(self, permission: str) -> bool:
+        """Return whether an Android runtime permission has been granted."""
+        if not self.android_available:
+            return True
+        try:
+            from android.permissions import check_permission  # type: ignore
+            return bool(check_permission(permission))
+        except Exception as exc:
+            self.logger.exception("Could not check %s permission: %s", permission, exc)
+            return False
+
+    def request_permissions(self, permissions: list[str], timeout_seconds: int = 30) -> dict[str, bool]:
+        """Request permissions on Android's UI thread and wait for the user's choice."""
+        if not self.android_available:
+            return {permission: True for permission in permissions}
+        missing = [permission for permission in permissions if not self.has_permission(permission)]
+        if not missing:
+            return {permission: True for permission in permissions}
+        try:
+            from android.permissions import request_permissions  # type: ignore
+            from android.runnable import run_on_ui_thread  # type: ignore
+            completed = threading.Event()
+
+            def on_result(_returned_permissions: Any, _grants: Any) -> None:
+                completed.set()
+
+            @run_on_ui_thread
+            def request_on_ui_thread() -> None:
+                request_permissions(missing, on_result)
+
+            request_on_ui_thread()
+            if not completed.wait(timeout_seconds):
+                self.logger.warning("Timed out waiting for Android permission result: %s", missing)
+            return {permission: self.has_permission(permission) for permission in permissions}
+        except Exception as exc:
+            self.logger.exception("Could not request Android permissions: %s", exc)
+            return {permission: self.has_permission(permission) for permission in permissions}
+
     def speak(self, text: str, speech_speed: float = 1.0) -> None:
         self.logger.info("TTS response: %s | speed=%s", text, speech_speed)
 
@@ -84,6 +123,9 @@ class AndroidNativeBridge:
             self.logger.info("Desktop call requested for %s", phone_number)
             return True
         try:
+            if not self.request_permissions(["android.permission.CALL_PHONE"]).get("android.permission.CALL_PHONE"):
+                self.logger.warning("Phone permission was not granted")
+                return False
             Intent = self._class("android.content.Intent")
             Uri = self._class("android.net.Uri")
             intent = Intent(Intent.ACTION_CALL, Uri.parse(f"tel:{phone_number}"))
@@ -98,6 +140,9 @@ class AndroidNativeBridge:
             self.logger.info("Desktop SMS requested for %s", phone_number)
             return True
         try:
+            if not self.request_permissions(["android.permission.SEND_SMS"]).get("android.permission.SEND_SMS"):
+                self.logger.warning("SMS permission was not granted")
+                return False
             SmsManager = self._class("android.telephony.SmsManager")
             SmsManager.getDefault().sendTextMessage(phone_number, None, message, None, None)
             return True
@@ -113,6 +158,9 @@ class AndroidNativeBridge:
             Intent = self._class("android.content.Intent")
             MediaStore = self._class("android.provider.MediaStore")
             if package_or_name == "camera":
+                if not self.request_permissions(["android.permission.CAMERA"]).get("android.permission.CAMERA"):
+                    self.logger.warning("Camera permission was not granted")
+                    return False
                 intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             else:
                 intent = self._activity.getPackageManager().getLaunchIntentForPackage(package_or_name)
@@ -144,6 +192,9 @@ class AndroidNativeBridge:
             self.logger.info("Desktop flashlight enabled=%s", enabled)
             return True
         try:
+            if not self.request_permissions(["android.permission.CAMERA"]).get("android.permission.CAMERA"):
+                self.logger.warning("Camera permission was not granted")
+                return False
             Context = self._class("android.content.Context")
             camera_manager = self._activity.getSystemService(Context.CAMERA_SERVICE)
             camera_id = camera_manager.getCameraIdList()[0]
@@ -219,6 +270,9 @@ class AndroidNativeBridge:
     def read_latest_sms(self) -> str:
         if self.android_available:
             try:
+                if not self.request_permissions(["android.permission.READ_SMS"]).get("android.permission.READ_SMS"):
+                    self.logger.warning("SMS read permission was not granted")
+                    return "SMS permission is required to read messages."
                 Uri = self._class("android.net.Uri")
                 cursor = self._activity.getContentResolver().query(
                     Uri.parse("content://sms/inbox"),
@@ -245,10 +299,12 @@ class AndroidNativeBridge:
         if not self.android_available:
             return {"started": False, "status": "unavailable", "message": "Speech recognition is available on Android only."}
         try:
-            from android.permissions import Permission, request_permissions  # type: ignore
-            from android.runnable import run_on_ui_thread  # type: ignore
             from jnius import PythonJavaClass, java_method  # type: ignore
-            request_permissions([Permission.RECORD_AUDIO])
+
+            from android.runnable import run_on_ui_thread  # type: ignore
+            microphone = "android.permission.RECORD_AUDIO"
+            if not self.request_permissions([microphone]).get(microphone):
+                return {"started": False, "status": "permission_denied", "message": "Microphone permission is required to start listening."}
             bridge = self
             class Listener(PythonJavaClass):
                 __javainterfaces__ = ["android/speech/RecognitionListener"]
@@ -266,7 +322,7 @@ class AndroidNativeBridge:
                 @java_method("(I)V")
                 def onError(self, code: int) -> None:
                     with bridge._speech_lock:
-                        bridge._speech_error = "No speech was recognised. Please try again." if code == 7 else f"Speech recognition stopped (error {code})."
+                        bridge._speech_error = {1: "Speech recognition network error.", 2: "Speech recognition network error.", 3: "Audio recording failed. Check microphone permission.", 5: "Speech recognition is busy. Please try again.", 6: "Speech recognition timed out. Please try again.", 7: "No speech was recognised. Please try again.", 9: "Microphone permission is required to start listening."}.get(code, f"Speech recognition stopped (error {code}).")
                 @java_method("(Landroid/os/Bundle;)V")
                 def onResults(self, bundle: Any) -> None:
                     recognizer = bridge._class("android.speech.SpeechRecognizer")
@@ -282,9 +338,11 @@ class AndroidNativeBridge:
                 SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
                 RecognizerIntent = self._class("android.speech.RecognizerIntent")
                 if not SpeechRecognizer.isRecognitionAvailable(self._activity):
-                    with self._speech_lock: self._speech_error = "Speech recognition is not available on this phone."
+                    with self._speech_lock:
+                        self._speech_error = "Speech recognition is not available on this phone."
                     return
-                if self._speech_recognizer is not None: self._speech_recognizer.destroy()
+                if self._speech_recognizer is not None:
+                    self._speech_recognizer.destroy()
                 self._speech_listener = Listener()
                 self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
                 self._speech_recognizer.setRecognitionListener(self._speech_listener)
@@ -292,7 +350,8 @@ class AndroidNativeBridge:
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, max(2, min(15, timeout_seconds)) * 1000)
                 self._speech_recognizer.startListening(intent)
-            with self._speech_lock: self._speech_result, self._speech_error = None, None
+            with self._speech_lock:
+                self._speech_result, self._speech_error = None, None
             begin()
             return {"started": True, "status": "listening"}
         except Exception as exc:

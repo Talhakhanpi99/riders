@@ -67,6 +67,9 @@ class PermissionManager:
         "notifications": PermissionDescriptor("notifications", "POST_NOTIFICATIONS", "Needed for notification alerts."),
         "camera": PermissionDescriptor("camera", "CAMERA", "Needed to control the torch and camera."),
         "location": PermissionDescriptor("location", "ACCESS_FINE_LOCATION", "Needed for location features."),
+        "phone": PermissionDescriptor("phone", "CALL_PHONE", "Needed to place a call."),
+        "send_sms": PermissionDescriptor("send_sms", "SEND_SMS", "Needed to send a text message."),
+        "read_sms": PermissionDescriptor("read_sms", "READ_SMS", "Needed to read the latest text message."),
     }
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
@@ -78,7 +81,7 @@ class PermissionManager:
             return False
         try:
             from android.permissions import check_permission  # type: ignore
-            return bool(check_permission(descriptor.android_name))
+            return bool(check_permission(f"android.permission.{descriptor.android_name}"))
         except Exception:
             return True
 
@@ -125,8 +128,8 @@ class IntentParser:
             (("brightness down", "decrease brightness", "roshni kam"), IntentType.BRIGHTNESS_DOWN),
             (("torch on", "open torch", "open the torch", "flashlight on", "light on", "torch kholo"), IntentType.FLASHLIGHT_ON),
             (("torch off", "close torch", "close the light", "flashlight off", "light off", "torch band"), IntentType.FLASHLIGHT_OFF),
-            (("volume up", "volume barhao"), IntentType.VOLUME_UP),
-            (("volume down", "volume kam"), IntentType.VOLUME_DOWN),
+            (("volume up", "increase volume", "volume barhao"), IntentType.VOLUME_UP),
+            (("volume down", "decrease volume", "volume kam"), IntentType.VOLUME_DOWN),
         ):
             if any(x in value for x in phrases):
                 return ParsedIntent(kind, raw, confidence=.93)
