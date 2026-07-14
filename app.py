@@ -309,6 +309,10 @@ def register_routes(
     def logs_page() -> str:
         return render_template("logs.html")
 
+    @flask_app.get("/developer")
+    def developer_page() -> str:
+        return render_template("developer.html")
+
     @flask_app.get("/api/status")
     def status() -> Any:
         return jsonify(
@@ -425,6 +429,18 @@ def register_routes(
                 }
             }
         )
+    @flask_app.post("/api/diagnostics/speech")
+    def speech_diagnostic() -> Any:
+        return jsonify(bridge.speech_diagnostic())
+
+    @flask_app.get("/api/diagnostics/logs")
+    def diagnostic_logs() -> Any:
+        try:
+            lines = (settings.log_dir / "voiceride.log").read_text(encoding="utf-8", errors="replace").splitlines()[-120:]
+        except Exception as exc:
+            lines = [f"Could not read diagnostics log: {exc}"]
+        return jsonify({"lines": lines})
+
     @flask_app.get("/api/diagnostics")
     def diagnostics() -> Any:
         permission_state = {
@@ -438,3 +454,5 @@ def register_routes(
             "settings": asdict(settings_service.get()),
             "recent_commands": history_repository.recent_commands(),
         })
+
+

@@ -166,6 +166,16 @@ class AndroidNativeBridge:
         except Exception as exc:
             self.logger.exception("Android TTS failed: %s", exc)
 
+    def speech_diagnostic(self) -> dict[str, Any]:
+        """Run an audible TTS test and expose state to the developer UI."""
+        if not self.android_available:
+            return {"ok": False, "message": "Android runtime is not available."}
+        try:
+            self.speak("VoiceRide speech test. If you hear this, text to speech is working.")
+            return {"ok": True, "message": "Speech test requested. Check media volume and Android Text to speech output settings if you hear nothing.", "tts_initialized": self._tts_ready}
+        except Exception as exc:
+            self.logger.exception("TTS diagnostic failed: %s", exc)
+            return {"ok": False, "message": f"TTS test failed: {exc}"}
     def _speak_now(self, text: str, speech_speed: float) -> None:
         if self._tts is None or not self._tts_ready:
             return
@@ -511,11 +521,12 @@ class AndroidNativeBridge:
         try:
             from pathlib import Path
             Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").unlink(missing_ok=True)
-            self._class("com.voiceride.voiceride.ServiceListener").start(self._activity, "")
+            # python-for-android generates services in org.kivy.android.
+            self._class("org.kivy.android.ServiceListener").start(self._activity, "")
             return {"started": True, "status": "starting", "message": "Offline listening is starting."}
         except Exception as exc:
             self.logger.exception("Could not start offline listener: %s", exc)
-            return {"started": False, "status": "error", "message": "Could not start offline listening."}
+            return {"started": False, "status": "error", "message": f"Could not start offline listening: {exc}"}
 
     def stop_offline_listener(self) -> dict[str, Any]:
         if not self.android_available:
@@ -572,3 +583,4 @@ class AndroidNativeBridge:
         except Exception as exc:
             self.logger.exception("Android vibration failed: %s", exc)
             return False
+
