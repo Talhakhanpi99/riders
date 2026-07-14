@@ -1,4 +1,4 @@
-"""Android-specific bridge code kept out of the top-level android namespace."""
+﻿"""Android-specific bridge code kept out of the top-level android namespace."""
 
 from __future__ import annotations
 
@@ -66,7 +66,17 @@ class AndroidNativeBridge:
             self._autoclass = autoclass
             self._activity = PythonActivity.mActivity
         except Exception:
-            self.logger.info("Android bridge running in desktop fallback mode")
+            # A python-for-android service has no PythonActivity, but it can
+            # still use a Service as an Android Context (notably for TTS).
+            try:
+                from jnius import autoclass  # type: ignore
+
+                PythonService = autoclass("org.kivy.android.PythonService")
+                self._autoclass = autoclass
+                self._activity = PythonService.mService
+                self.logger.info("Android bridge running from foreground service")
+            except Exception:
+                self.logger.info("Android bridge running in desktop fallback mode")
 
     @property
     def android_available(self) -> bool:
