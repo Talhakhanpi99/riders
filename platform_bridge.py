@@ -1,4 +1,4 @@
-﻿"""Android-specific bridge code kept out of the top-level android namespace."""
+"""Android-specific bridge code kept out of the top-level android namespace."""
 
 from __future__ import annotations
 
@@ -40,6 +40,102 @@ def launch_webview_if_available(url: str) -> None:
             logger.exception("Failed to launch Android WebView: %s", exc)
 
     threading.Timer(0.8, _launch).start()
+
+
+try:
+    from jnius import PythonJavaClass, java_method  # type: ignore
+
+    class TtsInitListener(PythonJavaClass):
+        __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, bridge: AndroidNativeBridge) -> None:
+            super().__init__()
+            self.bridge = bridge
+
+        @java_method("(I)V")
+        def onInit(self, status: int) -> None:
+            from jnius import autoclass
+            TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+            self.bridge._tts_ready = status == TextToSpeech.SUCCESS
+            if not self.bridge._tts_ready:
+                self.bridge.logger.error("Android TextToSpeech initialisation failed: %s", status)
+                return
+            self.bridge.logger.info("Android TextToSpeech is ready")
+            if self.bridge._tts_pending is not None:
+                pending_text, pending_speed = self.bridge._tts_pending
+                self.bridge._tts_pending = None
+                self.bridge._speak_now(pending_text, pending_speed)
+
+    class SpeechRecognitionListener(PythonJavaClass):
+        __javainterfaces__ = ["android/speech/RecognitionListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, bridge: AndroidNativeBridge) -> None:
+            super().__init__()
+            self.bridge = bridge
+
+        @java_method("(Landroid/os/Bundle;)V")
+        def onReadyForSpeech(self, _value: Any) -> None:
+            with self.bridge._speech_lock:
+                self.bridge._speech_state = "listening"
+            self.bridge.logger.info("Speech recognizer is ready")
+
+        @java_method("()V")
+        def onBeginningOfSpeech(self) -> None:
+            pass
+
+        @java_method("(F)V")
+        def onRmsChanged(self, _value: float) -> None:
+            pass
+
+        @java_method("([B)V")
+        def onBufferReceived(self, _value: Any) -> None:
+            pass
+
+        @java_method("()V")
+        def onEndOfSpeech(self) -> None:
+            pass
+
+        @java_method("(I)V")
+        def onError(self, code: int) -> None:
+            with self.bridge._speech_lock:
+                self.bridge._speech_state = "error"
+                self.bridge._speech_error = {
+                    1: "Speech recognition network error.",
+                    2: "Speech recognition network error.",
+                    3: "Audio recording failed. Check microphone permission.",
+                    5: "Speech recognition is busy. Please try again.",
+                    6: "Speech recognition timed out. Please try again.",
+                    7: "No speech was recognised. Please try again.",
+                    9: "Microphone permission is required to start listening.",
+                    13: "Offline speech recognition package is not installed. Please connect to the internet or download offline language data in Google settings."
+                }.get(code, f"Speech recognition stopped (error {code}).")
+
+        @java_method("(Landroid/os/Bundle;)V")
+        def onResults(self, bundle: Any) -> None:
+            recognizer = self.bridge._class("android.speech.SpeechRecognizer")
+            values = bundle.getStringArrayList(recognizer.RESULTS_RECOGNITION)
+            with self.bridge._speech_lock:
+                self.bridge._speech_state = "result"
+                self.bridge._speech_result = str(values.get(0)).strip() if values and values.size() else ""
+            self.bridge.logger.info("Speech recognizer result: %s", self.bridge._speech_result)
+
+        @java_method("(Landroid/os/Bundle;)V")
+        def onPartialResults(self, _value: Any) -> None:
+            pass
+
+        @java_method("(ILandroid/os/Bundle;)V")
+        def onEvent(self, _event: int, _value: Any) -> None:
+            pass
+except ImportError:
+    class TtsInitListener:  # type: ignore
+        def __init__(self, bridge: Any) -> None:
+            pass
+
+    class SpeechRecognitionListener:  # type: ignore
+        def __init__(self, bridge: Any) -> None:
+            pass
 
 
 class AndroidNativeBridge:
@@ -126,35 +222,14 @@ class AndroidNativeBridge:
         if not self.android_available or not text:
             return
         try:
-            from jnius import PythonJavaClass, java_method  # type: ignore
-
             from android.runnable import run_on_ui_thread  # type: ignore
-
-            bridge = self
-
-            class TtsInitListener(PythonJavaClass):
-                __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
-                __javacontext__ = "app"
-
-                @java_method("(I)V")
-                def onInit(self, status: int) -> None:
-                    TextToSpeech = bridge._class("android.speech.tts.TextToSpeech")
-                    bridge._tts_ready = status == TextToSpeech.SUCCESS
-                    if not bridge._tts_ready:
-                        bridge.logger.error("Android TextToSpeech initialisation failed: %s", status)
-                        return
-                    bridge.logger.info("Android TextToSpeech is ready")
-                    if bridge._tts_pending is not None:
-                        pending_text, pending_speed = bridge._tts_pending
-                        bridge._tts_pending = None
-                        bridge._speak_now(pending_text, pending_speed)
 
             @run_on_ui_thread
             def speak_on_ui_thread() -> None:
                 TextToSpeech = self._class("android.speech.tts.TextToSpeech")
                 if self._tts is None:
                     self._tts_pending = (text, speech_speed)
-                    self._tts_listener = TtsInitListener()
+                    self._tts_listener = TtsInitListener(self)
                     self._tts = TextToSpeech(self._activity, self._tts_listener)
                     return
                 if not self._tts_ready:
@@ -435,46 +510,10 @@ class AndroidNativeBridge:
         if not self.android_available:
             return {"started": False, "status": "unavailable", "message": "Speech recognition is available on Android only."}
         try:
-            from jnius import PythonJavaClass, java_method  # type: ignore
-
             from android.runnable import run_on_ui_thread  # type: ignore
             microphone = "android.permission.RECORD_AUDIO"
             if not self.request_permissions([microphone]).get(microphone):
                 return {"started": False, "status": "permission_denied", "message": "Microphone permission is required to start listening."}
-            bridge = self
-            class Listener(PythonJavaClass):
-                __javainterfaces__ = ["android/speech/RecognitionListener"]
-                __javacontext__ = "app"
-                @java_method("(Landroid/os/Bundle;)V")
-                def onReadyForSpeech(self, _value: Any) -> None:
-                    with bridge._speech_lock:
-                        bridge._speech_state = "listening"
-                    bridge.logger.info("Speech recognizer is ready")
-                @java_method("()V")
-                def onBeginningOfSpeech(self) -> None: pass
-                @java_method("(F)V")
-                def onRmsChanged(self, _value: float) -> None: pass
-                @java_method("([B)V")
-                def onBufferReceived(self, _value: Any) -> None: pass
-                @java_method("()V")
-                def onEndOfSpeech(self) -> None: pass
-                @java_method("(I)V")
-                def onError(self, code: int) -> None:
-                    with bridge._speech_lock:
-                        bridge._speech_state = "error"
-                        bridge._speech_error = {1: "Speech recognition network error.", 2: "Speech recognition network error.", 3: "Audio recording failed. Check microphone permission.", 5: "Speech recognition is busy. Please try again.", 6: "Speech recognition timed out. Please try again.", 7: "No speech was recognised. Please try again.", 9: "Microphone permission is required to start listening."}.get(code, f"Speech recognition stopped (error {code}).")
-                @java_method("(Landroid/os/Bundle;)V")
-                def onResults(self, bundle: Any) -> None:
-                    recognizer = bridge._class("android.speech.SpeechRecognizer")
-                    values = bundle.getStringArrayList(recognizer.RESULTS_RECOGNITION)
-                    with bridge._speech_lock:
-                        bridge._speech_state = "result"
-                        bridge._speech_result = str(values.get(0)).strip() if values and values.size() else ""
-                    bridge.logger.info("Speech recognizer result: %s", bridge._speech_result)
-                @java_method("(Landroid/os/Bundle;)V")
-                def onPartialResults(self, _value: Any) -> None: pass
-                @java_method("(ILandroid/os/Bundle;)V")
-                def onEvent(self, _event: int, _value: Any) -> None: pass
             @run_on_ui_thread
             def begin() -> None:
                 SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
@@ -487,7 +526,7 @@ class AndroidNativeBridge:
                     return
                 if self._speech_recognizer is not None:
                     self._speech_recognizer.destroy()
-                self._speech_listener = Listener()
+                self._speech_listener = SpeechRecognitionListener(self)
                 self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
                 self._speech_recognizer.setRecognitionListener(self._speech_listener)
                 intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -521,8 +560,8 @@ class AndroidNativeBridge:
         try:
             from pathlib import Path
             Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").unlink(missing_ok=True)
-            # python-for-android generates services in org.kivy.android.
-            self._class("org.kivy.android.ServiceListener").start(self._activity, "")
+            package_name = self._activity.getPackageName()
+            self._class(f"{package_name}.ServiceListener").start(self._activity, "")
             return {"started": True, "status": "starting", "message": "Offline listening is starting."}
         except Exception as exc:
             self.logger.exception("Could not start offline listener: %s", exc)

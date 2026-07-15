@@ -4,6 +4,34 @@ const responseText = document.querySelector("#assistantResponse");
 const commandInput = document.querySelector("#commandInput");
 let polling = false;
 let offlineListening = false;
+let androidAvailable = false;
+let speechSpeed = 1.0;
+
+async function checkAndroidStatus() {
+  try {
+    const res = await (await fetch("/api/status")).json();
+    androidAvailable = res.android_available;
+    if (res.settings && res.settings.speech_speed) {
+      speechSpeed = parseFloat(res.settings.speech_speed);
+    }
+  } catch (err) {
+    console.error("Could not fetch status:", err);
+    androidAvailable = false;
+  }
+}
+
+function speakText(text) {
+  if (androidAvailable) {
+    // Native Android TTS handles speech inside WebView.
+    return;
+  }
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = speechSpeed || 1.0;
+    window.speechSynthesis.speak(utterance);
+  }
+}
 
 async function requestStartupPermissions() {
   try {
@@ -30,6 +58,9 @@ async function runCommand(text, requireWakeWord = false) {
     const payload = await response.json();
     responseText.textContent = payload.response || "No response received.";
     setState(payload.success ? "Done" : "Ready");
+    if (payload.response) {
+      speakText(payload.response);
+    }
   } catch { responseText.textContent = "I could not reach the assistant."; setState("Offline"); }
 }
 
@@ -63,6 +94,7 @@ async function toggleOfflineListening() {
     responseText.textContent = error.message || "Offline listener could not be changed.";
   }
 }
+
 async function pollForSpeech() {
   if (!polling) return;
   try {
@@ -74,11 +106,17 @@ async function pollForSpeech() {
     }
     if (event.status === "wake_detected") {
       responseText.textContent = event.response;
+      if (event.response) {
+        speakText(event.response);
+      }
       polling = false;
       setTimeout(startListening, 150);
       return;
     }
     responseText.textContent = event.response || event.message || "No speech was recognised.";
+    if (event.response) {
+      speakText(event.response);
+    }
     if (event.transcript) commandInput.value = event.transcript;
     setState(event.success ? "Done" : "Ready");
   } catch {
@@ -93,4 +131,7 @@ commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter")
 document.querySelector("#listenButton").addEventListener("click", startListening);
 document.querySelector("#offlineListenButton").addEventListener("click", toggleOfflineListening);
 document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));
-requestStartupPermissions().finally(startListening);
+
+requestStartupPermissions().finally(() => {
+  checkAndroidStatus().finally(startListening);
+});
