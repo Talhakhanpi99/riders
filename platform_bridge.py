@@ -255,8 +255,10 @@ class AndroidNativeBridge:
         if self._tts is None or not self._tts_ready:
             return
         TextToSpeech = self._class("android.speech.tts.TextToSpeech")
+        Bundle = self._class("android.os.Bundle")
+        bundle = Bundle()
         self._tts.setSpeechRate(max(0.7, min(1.3, speech_speed)))
-        result = self._tts.speak(text, TextToSpeech.QUEUE_FLUSH, None, "voiceride")
+        result = self._tts.speak(text, TextToSpeech.QUEUE_FLUSH, bundle, "voiceride")
         if result == TextToSpeech.ERROR:
             self.logger.error("Android TextToSpeech rejected speech output")
     def signal_wake(self, mode: str) -> bool:
@@ -560,8 +562,31 @@ class AndroidNativeBridge:
         try:
             from pathlib import Path
             Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").unlink(missing_ok=True)
-            package_name = self._activity.getPackageName()
-            self._class(f"{package_name}.ServiceListener").start(self._activity, "")
+            
+            import threading
+            completed = threading.Event()
+            error_container: list[Exception] = []
+            
+            def run_on_main_thread(dt: float) -> None:
+                try:
+                    from jnius import autoclass
+                    package_name = self._activity.getPackageName()
+                    ServiceClass = autoclass(f"{package_name}.ServiceListener")
+                    ServiceClass.start(self._activity, "")
+                except Exception as e:
+                    error_container.append(e)
+                finally:
+                    completed.set()
+            
+            from kivy.clock import Clock
+            Clock.schedule_once(run_on_main_thread)
+            
+            if not completed.wait(timeout=5.0):
+                return {"started": False, "status": "error", "message": "Timeout starting offline listening on main thread."}
+            
+            if error_container:
+                raise error_container[0]
+                
             return {"started": True, "status": "starting", "message": "Offline listening is starting."}
         except Exception as exc:
             self.logger.exception("Could not start offline listener: %s", exc)
