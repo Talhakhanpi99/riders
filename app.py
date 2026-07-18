@@ -1,4 +1,4 @@
-﻿"""Flask application, database, settings, routes, and dependency wiring."""
+"""Flask application, database, settings, routes, and dependency wiring."""
 
 from __future__ import annotations
 
@@ -309,10 +309,6 @@ def register_routes(
     def logs_page() -> str:
         return render_template("logs.html")
 
-    @flask_app.get("/developer")
-    def developer_page() -> str:
-        return render_template("developer.html")
-
     @flask_app.get("/api/status")
     def status() -> Any:
         return jsonify(
@@ -320,6 +316,9 @@ def register_routes(
                 "app": "VoiceRide",
                 "android_available": bridge.android_available,
                 "settings": asdict(settings_service.get()),
+                "last_transcript": assistant.last_transcript,
+                "last_response": assistant.last_response,
+                "last_update_id": assistant.last_update_id,
             }
         )
 
@@ -369,7 +368,7 @@ def register_routes(
             bridge.signal_wake(user_settings.wake_feedback_mode)
             bridge.speak("Yes, I am here.", user_settings.speech_speed)
             return jsonify({"status": "wake_detected", "transcript": transcript, "response": "Yes, I am here."})
-        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up())
+        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up(), is_offline_service=True)
         result.update({"status": "completed", "transcript": transcript})
         return jsonify(result)
 

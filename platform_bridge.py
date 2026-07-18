@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any
 
+WEBVIEW_INSTANCE: Any | None = None
+
 
 def launch_webview_if_available(url: str) -> None:
     """Open an Android WebView for the local Flask frontend.
@@ -25,6 +27,7 @@ def launch_webview_if_available(url: str) -> None:
 
     @run_on_ui_thread
     def _launch() -> None:
+        global WEBVIEW_INSTANCE
         try:
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             WebView = autoclass("android.webkit.WebView")
@@ -36,6 +39,7 @@ def launch_webview_if_available(url: str) -> None:
             webview.setWebViewClient(WebViewClient())
             webview.loadUrl(url)
             activity.setContentView(webview)
+            WEBVIEW_INSTANCE = webview
         except Exception as exc:
             logger.exception("Failed to launch Android WebView: %s", exc)
 
@@ -57,10 +61,15 @@ try:
         def onInit(self, status: int) -> None:
             from jnius import autoclass
             TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+            Locale = autoclass("java.util.Locale")
             self.bridge._tts_ready = status == TextToSpeech.SUCCESS
             if not self.bridge._tts_ready:
                 self.bridge.logger.error("Android TextToSpeech initialisation failed: %s", status)
                 return
+            try:
+                self.bridge._tts.setLanguage(Locale.US)
+            except Exception as e:
+                self.bridge.logger.exception("Failed to set TTS language to Locale.US: %s", e)
             self.bridge.logger.info("Android TextToSpeech is ready")
             if self.bridge._tts_pending is not None:
                 pending_text, pending_speed = self.bridge._tts_pending
@@ -128,6 +137,56 @@ try:
         @java_method("(ILandroid/os/Bundle;)V")
         def onEvent(self, _event: int, _value: Any) -> None:
             pass
+
+    class VoskModelCallback(PythonJavaClass):
+        __javainterfaces__ = ["org/vosk/android/StorageService$Callback"]
+        __javacontext__ = "app"
+
+        def __init__(self, loaded_model: list[object], ready: threading.Event, logger: Any) -> None:
+            super().__init__()
+            self.loaded_model = loaded_model
+            self.ready = ready
+            self.logger = logger
+
+        @java_method("(Lorg/vosk/Model;)V")
+        def onComplete(self, model: object) -> None:
+            self.loaded_model.append(model)
+            self.ready.set()
+
+        @java_method("(Ljava/lang/Exception;)V")
+        def onError(self, error: object) -> None:
+            self.logger.error("Could not unpack the local Vosk model: %s", error)
+            self.ready.set()
+
+    class VoskRecognitionCallback(PythonJavaClass):
+        __javainterfaces__ = ["org/vosk/android/RecognitionListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, on_result_fn: Any, on_error_fn: Any) -> None:
+            super().__init__()
+            self.on_result_fn = on_result_fn
+            self.on_error_fn = on_error_fn
+
+        @java_method("(Ljava/lang/String;)V")
+        def onPartialResult(self, _hypothesis: str) -> None:
+            pass
+
+        @java_method("(Ljava/lang/String;)V")
+        def onResult(self, hypothesis: str) -> None:
+            self.on_result_fn(hypothesis)
+
+        @java_method("(Ljava/lang/String;)V")
+        def onFinalResult(self, hypothesis: str) -> None:
+            self.on_result_fn(hypothesis)
+
+        @java_method("(Ljava/lang/Exception;)V")
+        def onError(self, error: object) -> None:
+            self.on_error_fn(error)
+
+        @java_method("()V")
+        def onTimeout(self) -> None:
+            pass
+
 except ImportError:
     class TtsInitListener:  # type: ignore
         def __init__(self, bridge: Any) -> None:
@@ -135,6 +194,14 @@ except ImportError:
 
     class SpeechRecognitionListener:  # type: ignore
         def __init__(self, bridge: Any) -> None:
+            pass
+
+    class VoskModelCallback:  # type: ignore
+        def __init__(self, loaded_model: list[object], ready: threading.Event, logger: Any) -> None:
+            pass
+
+    class VoskRecognitionCallback:  # type: ignore
+        def __init__(self, on_result_fn: Any, on_error_fn: Any) -> None:
             pass
 
 
@@ -155,6 +222,10 @@ class AndroidNativeBridge:
         self._tts_ready = False
         self._tts_pending: tuple[str, float] | None = None
         self._speech_lock = threading.Lock()
+        self._vosk_model: Any = None
+        self._vosk_loading: bool = False
+        self._vosk_speech_service: Any = None
+
         try:
             from jnius import autoclass  # type: ignore
 
@@ -173,6 +244,75 @@ class AndroidNativeBridge:
                 self.logger.info("Android bridge running from foreground service")
             except Exception:
                 self.logger.info("Android bridge running in desktop fallback mode")
+
+        if self.android_available:
+            # Start loading Vosk model in a background thread
+            threading.Thread(target=self._load_vosk_model, daemon=True).start()
+
+            # Initialize TTS early
+            try:
+                from jnius import autoclass
+                PythonService = autoclass("org.kivy.android.PythonService")
+                is_service = isinstance(self._activity, PythonService)
+            except Exception:
+                is_service = False
+
+            try:
+                if not is_service:
+                    from android.runnable import run_on_ui_thread  # type: ignore
+                    @run_on_ui_thread
+                    def init_tts() -> None:
+                        try:
+                            TextToSpeech = self._class("android.speech.tts.TextToSpeech")
+                            self._tts_listener = TtsInitListener(self)
+                            self._tts = TextToSpeech(self._activity, self._tts_listener)
+                        except Exception as e:
+                            self.logger.exception("Failed to initialize TTS on startup: %s", e)
+                    init_tts()
+                else:
+                    TextToSpeech = self._class("android.speech.tts.TextToSpeech")
+                    self._tts_listener = TtsInitListener(self)
+                    self._tts = TextToSpeech(self._activity, self._tts_listener)
+            except Exception as e:
+                self.logger.exception("Failed to schedule TTS initialization: %s", e)
+
+    def _load_vosk_model(self) -> None:
+        try:
+            self._vosk_loading = True
+            self.logger.info("Starting background loading of Vosk model...")
+            from jnius import autoclass
+            StorageService = autoclass("org.vosk.android.StorageService")
+
+            ready = threading.Event()
+            loaded_model: list[object] = []
+            callback = VoskModelCallback(loaded_model, ready, self.logger)
+
+            StorageService.unpack(self._activity, "model-en-us", "model-en-us", callback)
+            if ready.wait(45) and loaded_model:
+                self._vosk_model = loaded_model[0]
+                self.logger.info("Vosk model successfully loaded in main app process.")
+            else:
+                self.logger.error("Vosk model failed to load in background.")
+        except Exception as exc:
+            self.logger.exception("Error loading Vosk model: %s", exc)
+        finally:
+            self._vosk_loading = False
+
+    def evaluate_javascript(self, js_code: str) -> None:
+        global WEBVIEW_INSTANCE
+        if not self.android_available or WEBVIEW_INSTANCE is None:
+            return
+        try:
+            from android.runnable import run_on_ui_thread  # type: ignore
+            @run_on_ui_thread
+            def _run() -> None:
+                try:
+                    WEBVIEW_INSTANCE.evaluateJavascript(js_code, None)
+                except Exception as exc:
+                    self.logger.warning("Failed to evaluate JS: %s", exc)
+            _run()
+        except Exception as exc:
+            self.logger.warning("Could not run JS on UI thread: %s", exc)
 
     @property
     def android_available(self) -> bool:
@@ -271,96 +411,96 @@ class AndroidNativeBridge:
         self.logger.info("Wake signal requested: %s", mode)
         return True
 
-    def call_number(self, phone_number: str) -> bool:
+    def call_number(self, phone_number: str) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop call requested for %s", phone_number)
-            return True
+            return True, "Call simulated on desktop."
         try:
             if not self.request_permissions(["android.permission.CALL_PHONE"]).get("android.permission.CALL_PHONE"):
                 self.logger.warning("Phone permission was not granted")
-                return False
+                return False, "Phone calling permission was denied. Please go to your phone settings, select VoiceRide, and allow the Phone permission."
             Intent = self._class("android.content.Intent")
             Uri = self._class("android.net.Uri")
             intent = Intent(Intent.ACTION_CALL, Uri.parse(f"tel:{phone_number}"))
             self._activity.startActivity(intent)
-            return True
+            return True, f"Placing call to {phone_number}."
         except Exception as exc:
             self.logger.exception("Android call failed: %s", exc)
-            return False
+            return False, f"Android system call failed. Error: {exc}. Please verify if your device has calling capabilities and the SIM card is active."
 
-    def send_sms(self, phone_number: str, message: str) -> bool:
+    def send_sms(self, phone_number: str, message: str) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop SMS requested for %s", phone_number)
-            return True
+            return True, "SMS sending simulated on desktop."
         try:
             if not self.request_permissions(["android.permission.SEND_SMS"]).get("android.permission.SEND_SMS"):
                 self.logger.warning("SMS permission was not granted")
-                return False
+                return False, "SMS sending permission was denied. Please allow SMS permission for VoiceRide in your phone settings."
             SmsManager = self._class("android.telephony.SmsManager")
             SmsManager.getDefault().sendTextMessage(phone_number, None, message, None, None)
-            return True
+            return True, "Message sent successfully."
         except Exception as exc:
             self.logger.exception("Android SMS failed: %s", exc)
-            return False
+            return False, f"SMS sending failed. Error: {exc}. Please check your SIM network status, cellular balance, or try restarting the app."
 
-    def open_application(self, package_or_name: str) -> bool:
+    def open_application(self, package_or_name: str) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop app open requested: %s", package_or_name)
-            return True
+            return True, f"Application {package_or_name} opening simulated on desktop."
         try:
             Intent = self._class("android.content.Intent")
             MediaStore = self._class("android.provider.MediaStore")
             if package_or_name == "camera":
                 if not self.request_permissions(["android.permission.CAMERA"]).get("android.permission.CAMERA"):
                     self.logger.warning("Camera permission was not granted")
-                    return False
+                    return False, "Camera permission was denied. Please allow Camera permission in settings to open the camera."
                 intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             else:
                 intent = self._activity.getPackageManager().getLaunchIntentForPackage(package_or_name)
                 if intent is None:
-                    return False
+                    return False, f"Application {package_or_name} is not installed on this device. Please check the package name."
             self._activity.startActivity(intent)
-            return True
+            return True, f"Opened {package_or_name}."
         except Exception as exc:
             self.logger.exception("Android app launch failed: %s", exc)
-            return False
+            return False, f"Failed to open {package_or_name}. Error: {exc}."
 
-    def close_application(self, package_or_name: str = "") -> bool:
+    def close_application(self, package_or_name: str = "") -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop app close requested: %s", package_or_name or "current")
-            return True
+            return True, "Application close simulated on desktop."
         try:
             Intent = self._class("android.content.Intent")
             intent = Intent(Intent.ACTION_MAIN)
             intent.addCategory(Intent.CATEGORY_HOME)
             intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             self._activity.startActivity(intent)
-            return True
+            return True, "Returned to home screen."
         except Exception as exc:
             self.logger.exception("Android close app failed: %s", exc)
-            return False
+            return False, f"Failed to close application. Error: {exc}."
 
-    def set_flashlight(self, enabled: bool) -> bool:
+    def set_flashlight(self, enabled: bool) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop flashlight enabled=%s", enabled)
-            return True
+            return True, f"Flashlight simulated {'on' if enabled else 'off'} on desktop."
         try:
             if not self.request_permissions(["android.permission.CAMERA"]).get("android.permission.CAMERA"):
                 self.logger.warning("Camera permission was not granted")
-                return False
+                return False, "Camera permission is denied, which is required to control the flashlight. Please allow Camera access for VoiceRide in your Android settings."
             Context = self._class("android.content.Context")
             camera_manager = self._activity.getSystemService(Context.CAMERA_SERVICE)
             camera_id = camera_manager.getCameraIdList()[0]
             camera_manager.setTorchMode(camera_id, enabled)
-            return True
+            return True, f"Torch turned {'on' if enabled else 'off'}."
         except Exception as exc:
             self.logger.exception("Android flashlight failed: %s", exc)
-            return False
+            return False, f"Could not control flashlight. Error: {exc}. This might happen if another app (like the Camera app) is currently using the camera, or if your device does not support torch controls."
 
-    def adjust_volume(self, direction: str) -> bool:
+    def adjust_volume(self, direction: str) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop volume adjustment requested: %s", direction)
-            return True
+            return True, f"Volume adjustment to {direction} simulated on desktop."
         try:
             Context = self._class("android.content.Context")
             AudioManager = self._class("android.media.AudioManager")
@@ -371,46 +511,62 @@ class AndroidNativeBridge:
                 "mute": AudioManager.ADJUST_MUTE,
             }.get(direction, AudioManager.ADJUST_SAME)
             audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, adjustment, AudioManager.FLAG_SHOW_UI)
-            return True
+            return True, f"Volume adjusted {direction}."
         except Exception as exc:
             self.logger.exception("Android volume failed: %s", exc)
-            return False
+            return False, f"Failed to adjust volume. Error: {exc}."
 
-    def set_wifi(self, enabled: bool) -> bool:
+    def set_wifi(self, enabled: bool) -> tuple[bool, str]:
         self.logger.info("WiFi change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.WIFI_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True, "WiFi settings simulation."
+        success = self._open_settings_panel("android.settings.WIFI_SETTINGS")
+        if success:
+            return True, "I have opened the WiFi settings page. Android security requires you to toggle WiFi manually here."
+        return False, "Failed to open WiFi settings page."
 
-    def set_hotspot(self, enabled: bool) -> bool:
+    def set_hotspot(self, enabled: bool) -> tuple[bool, str]:
         self.logger.info("Hotspot change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.WIRELESS_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True, "Hotspot settings simulation."
+        success = self._open_settings_panel("android.settings.WIRELESS_SETTINGS")
+        if success:
+            return True, "I have opened the Hotspot settings page. Android security requires you to toggle Hotspot manually here."
+        return False, "Failed to open Hotspot settings page."
 
-    def set_bluetooth(self, enabled: bool) -> bool:
+    def set_bluetooth(self, enabled: bool) -> tuple[bool, str]:
         self.logger.info("Bluetooth change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.BLUETOOTH_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True, "Bluetooth settings simulation."
+        success = self._open_settings_panel("android.settings.BLUETOOTH_SETTINGS")
+        if success:
+            return True, "I have opened the Bluetooth settings page. Android security requires you to toggle Bluetooth manually here."
+        return False, "Failed to open Bluetooth settings page."
 
-    def set_brightness(self, percentage: int) -> bool:
+    def set_brightness(self, percentage: int) -> tuple[bool, str]:
         """Set device brightness after the user grants Android special access once."""
         return self._write_system_brightness(max(0, min(100, percentage)))
 
-    def adjust_brightness(self, direction: str) -> bool:
+    def adjust_brightness(self, direction: str) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop brightness adjustment requested: %s", direction)
-            return True
+            return True, f"Brightness adjustment {direction} simulated on desktop."
         try:
             Settings = self._class("android.provider.Settings")
             current = Settings.System.getInt(
                 self._activity.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 128
             )
             change = 26 if direction == "up" else -26
-            return self._write_system_brightness(round((current + change) * 100 / 255))
+            new_percentage = round((current + change) * 100 / 255)
+            return self._write_system_brightness(new_percentage)
         except Exception as exc:
             self.logger.exception("Android brightness adjustment failed: %s", exc)
-            return False
+            return False, f"Failed to adjust brightness. Error: {exc}."
 
-    def _write_system_brightness(self, percentage: int) -> bool:
+    def _write_system_brightness(self, percentage: int) -> tuple[bool, str]:
         if not self.android_available:
             self.logger.info("Desktop brightness set to %s%%", percentage)
-            return True
+            return True, f"Brightness set to {percentage} percent simulated."
         try:
             Settings = self._class("android.provider.Settings")
             if not Settings.System.canWrite(self._activity):
@@ -419,14 +575,14 @@ class AndroidNativeBridge:
                 intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse(f"package:{self._activity.getPackageName()}"))
                 self._activity.startActivity(intent)
                 self.logger.warning("WRITE_SETTINGS special access is required for device brightness")
-                return False
+                return False, "This action requires system write settings permission to change screen brightness. I have opened the settings screen, please toggle on 'Allow modifying system settings' for VoiceRide, then try the command again."
             value = max(1, min(255, round(percentage * 255 / 100)))
             Settings.System.putInt(self._activity.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, value)
             self._set_window_brightness(percentage)
-            return True
+            return True, f"Brightness set to {percentage} percent."
         except Exception as exc:
             self.logger.exception("Android brightness set failed: %s", exc)
-            return False
+            return False, f"Could not change system brightness. Error: {exc}."
 
     def _set_window_brightness(self, percentage: int) -> bool:
         try:
@@ -508,49 +664,76 @@ class AndroidNativeBridge:
         return "You have no unread notifications."
 
     def start_listening(self, timeout_seconds: int = 5) -> dict[str, Any]:
-        """Run one short Android recognition session; the microphone is not kept open."""
+        """Run one short Android recognition session using the offline Vosk engine."""
         if not self.android_available:
             return {"started": False, "status": "unavailable", "message": "Speech recognition is available on Android only."}
+        microphone = "android.permission.RECORD_AUDIO"
+        if not self.request_permissions([microphone]).get(microphone):
+            return {"started": False, "status": "permission_denied", "message": "Microphone permission is required to start listening."}
+
+        if self._vosk_model is None:
+            if self._vosk_loading:
+                return {"started": False, "status": "loading", "message": "Offline speech engine is initializing. Please wait a moment."}
+            else:
+                threading.Thread(target=self._load_vosk_model, daemon=True).start()
+                return {"started": False, "status": "loading", "message": "Offline speech engine is starting up. Please try again in a few seconds."}
+
         try:
-            from android.runnable import run_on_ui_thread  # type: ignore
-            microphone = "android.permission.RECORD_AUDIO"
-            if not self.request_permissions([microphone]).get(microphone):
-                return {"started": False, "status": "permission_denied", "message": "Microphone permission is required to start listening."}
-            @run_on_ui_thread
-            def begin() -> None:
-                SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
-                RecognizerIntent = self._class("android.speech.RecognizerIntent")
-                Intent = self._class("android.content.Intent")
-                if not SpeechRecognizer.isRecognitionAvailable(self._activity):
-                    with self._speech_lock:
-                        self._speech_state = "error"
-                        self._speech_error = "Speech recognition is not available on this phone."
-                    return
-                if self._speech_recognizer is not None:
-                    self._speech_recognizer.destroy()
-                self._speech_listener = SpeechRecognitionListener(self)
-                self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
-                self._speech_recognizer.setRecognitionListener(self._speech_listener)
-                intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, max(2, min(15, timeout_seconds)) * 1000)
-                self._speech_recognizer.startListening(intent)
+            from jnius import autoclass
+            Recognizer = autoclass("org.vosk.Recognizer")
+            SpeechService = autoclass("org.vosk.android.SpeechService")
+
             with self._speech_lock:
                 self._speech_result, self._speech_error = None, None
-                self._speech_state = "starting"
-            begin()
-            def fail_if_not_ready() -> None:
+                self._speech_state = "listening"
+
+                if self._vosk_speech_service is not None:
+                    try:
+                        self._vosk_speech_service.stop()
+                    except Exception:
+                        pass
+                    self._vosk_speech_service = None
+
+                recognizer = Recognizer(self._vosk_model, 16000.0)
+
+                def on_result(hypothesis: str) -> None:
+                    import json
+                    try:
+                        text = json.loads(hypothesis).get("text", "").strip()
+                    except Exception:
+                        text = ""
+                    if text:
+                        with self._speech_lock:
+                            self._speech_result = text
+                            self._speech_state = "result"
+                        try:
+                            self._vosk_speech_service.stop()
+                        except Exception:
+                            pass
+
+                def on_error(error: Any) -> None:
+                    with self._speech_lock:
+                        self._speech_error = f"Offline speech recognition error: {error}"
+                        self._speech_state = "error"
+
+                listener = VoskRecognitionCallback(on_result, on_error)
+                self._vosk_speech_service = SpeechService(recognizer, 16000.0)
+                self._vosk_speech_service.startListening(listener)
+
+            def safety_timeout() -> None:
                 with self._speech_lock:
-                    if self._speech_state != "starting":
-                        return
-                    self._speech_state = "error"
-                    self._speech_error = "Android did not initialize speech recognition. Check the phone speech service and try again."
-                self.logger.error("Speech recognizer never reached onReadyForSpeech")
-            threading.Timer(4.0, fail_if_not_ready).start()
-            return {"started": True, "status": "starting"}
+                    if self._speech_state == "listening":
+                        self._speech_state = "error"
+                        self._speech_error = "Speech recognition timed out."
+                        try:
+                            self._vosk_speech_service.stop()
+                        except Exception:
+                            pass
+            threading.Timer(float(timeout_seconds), safety_timeout).start()
+            return {"started": True, "status": "listening"}
         except Exception as exc:
-            self.logger.exception("Could not start speech recognition: %s", exc)
-            return {"started": False, "status": "error", "message": "Could not start speech recognition."}
+            self.logger.exception("Could not start offline Vosk listening: %s", exc)
+            return {"started": False, "status": "error", "message": f"Could not start local offline listener: {exc}"}
 
     def start_offline_listener(self) -> dict[str, Any]:
         """Start the bundled Vosk foreground service from the visible activity."""
@@ -567,7 +750,10 @@ class AndroidNativeBridge:
             completed = threading.Event()
             error_container: list[Exception] = []
             
-            def run_on_main_thread(dt: float) -> None:
+            from android.runnable import run_on_ui_thread  # type: ignore
+            
+            @run_on_ui_thread
+            def run_on_android_ui_thread() -> None:
                 try:
                     from jnius import autoclass
                     package_name = self._activity.getPackageName()
@@ -578,8 +764,7 @@ class AndroidNativeBridge:
                 finally:
                     completed.set()
             
-            from kivy.clock import Clock
-            Clock.schedule_once(run_on_main_thread)
+            run_on_android_ui_thread()
             
             if not completed.wait(timeout=5.0):
                 return {"started": False, "status": "error", "message": "Timeout starting offline listening on main thread."}

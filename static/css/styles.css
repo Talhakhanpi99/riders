@@ -206,3 +206,68 @@ select {
 
 body{background:radial-gradient(circle at 50% -15%,#1a654f 0,#0b1117 42%,#070a0e 100%);min-height:100vh}
 .app-shell{max-width:760px;padding:20px 18px 42px}.top-bar h1 span{color:#55e6aa;font-size:.42em;margin-left:6px;vertical-align:top}.nav-actions a{padding:9px 12px;border:1px solid var(--line);border-radius:99px;color:var(--muted);font-size:.84rem}.hero{overflow:hidden;text-align:center;background:linear-gradient(145deg,rgba(29,48,48,.94),rgba(12,18,25,.95));border-radius:24px}.service-pill{display:flex;align-items:center;justify-content:center;gap:8px;color:#9ff3ca;font-size:.8rem;font-weight:700}.service-pill i{width:9px;height:9px;border-radius:50%;background:#55e6aa;box-shadow:0 0 14px #55e6aa}.status-ring{border:1px solid rgba(85,230,170,.45);padding:11px;background:conic-gradient(#55e6aa 0 40%,#31424b 40% 100%);box-shadow:0 0 50px rgba(85,230,170,.16)}.ring-core{width:100%;height:100%;border-radius:50%;background:#111b21;display:grid;place-content:center;gap:9px}.ring-core small,.panel-label{font-size:.68rem;font-weight:800;letter-spacing:.13em;color:#6eeeb3}.ring-core strong{font-size:1.45rem}.hero-copy,.hint{margin:0 auto;color:var(--muted);line-height:1.55;max-width:470px}.hint{font-size:.78rem}.action-row{display:grid;grid-template-columns:1fr 58px;gap:10px}.primary-action,.icon-action,.send-action{border:0;border-radius:14px;font-weight:800;cursor:pointer}.primary-action{min-height:58px;background:linear-gradient(135deg,#62edb6,#3bc6e5);color:#05110e}.icon-action{background:#213038;color:#b9ffe0}.response-panel,.command-card{border-radius:18px;background:rgba(20,29,37,.82);border:1px solid var(--line)}.response-panel{padding:18px}.command-card{margin-top:18px;padding:12px;display:grid;grid-template-columns:1fr auto;gap:10px}.command-card input{min-height:45px}.send-action{padding:0 20px;background:#273846;color:#e9fff5}.quick-section{margin-top:25px}.quick-section h2{margin:5px 0 14px;font-size:1.2rem}.quick-grid{grid-template-columns:repeat(3,1fr)}.quick-grid button{min-height:86px;border-radius:16px;text-align:left;padding:12px;background:linear-gradient(145deg,#1a2630,#111a20);border:1px solid rgba(255,255,255,.07)}.quick-grid b{display:block;color:#7aeec0;font-size:.75rem;margin-bottom:7px}.status-ring.listening{animation:pulse 1.3s infinite;border-color:#79edff}@keyframes pulse{50%{transform:scale(1.025);box-shadow:0 0 65px rgba(92,222,255,.35)}}@media(max-width:420px){.quick-grid{grid-template-columns:repeat(2,1fr)}}.developer-shell pre{max-height:42vh;overflow:auto;white-space:pre-wrap;color:#bafee0;font-size:.73rem}.diag-row{margin:8px 0;padding:10px;border-radius:10px;background:#1a2931}.diag-row.pass{border-left:3px solid #59f0aa}.diag-row.fail{border-left:3px solid #ff6680}@media(max-height:720px){.top-bar{margin-bottom:12px}.control-panel{gap:10px;padding:14px}.status-ring{width:min(49vw,220px)}.hero-copy,.hint{font-size:.78rem}.response-panel{margin-top:10px}.command-card{margin-top:10px}.app-shell{padding-top:12px}}
+
+/* Ensure the application is 100% viewport-height and fits exactly on one page without scrolling */
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.app-shell {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 12px 16px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.control-panel.hero {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  padding: 12px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.status-ring {
+  width: min(22vh, 160px) !important;
+  height: min(22vh, 160px) !important;
+  margin: 4px auto !important;
+}
+
+.response-panel {
+  margin-top: 4px !important;
+  padding: 12px !important;
+  max-height: 16vh;
+  overflow-y: auto;
+}
+
+.command-card {
+  margin-top: 4px !important;
+}
+
+/* Allow settings form and logs list to scroll internally, keeping the top bar fixed */
+.settings-form, .log-list {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 24px;
+}
+
+@media (max-height: 650px) {
+  .hero-copy, .hint {
+    display: none !important;
+  }
+  .top-bar {
+    margin-bottom: 4px !important;
+  }
+  .app-shell {
+    padding: 8px 12px;
+  }
+}

@@ -6,29 +6,23 @@ let polling = false;
 let offlineListening = false;
 let androidAvailable = false;
 let speechSpeed = 1.0;
-
-async function checkAndroidStatus() {
-  try {
-    const res = await (await fetch("/api/status")).json();
-    androidAvailable = res.android_available;
-    if (res.settings && res.settings.speech_speed) {
-      speechSpeed = parseFloat(res.settings.speech_speed);
-    }
-  } catch (err) {
-    console.error("Could not fetch status:", err);
-    androidAvailable = false;
-  }
-}
+let lastUpdateId = 0;
 
 function speakText(text) {
-  if (androidAvailable) {
-    // Native Android TTS handles speech inside WebView.
-    return;
-  }
   if ('speechSynthesis' in window) {
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = speechSpeed || 1.0;
+    
+    // Choose a high-quality Siri-like voice if available
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      const preferred = voices.find(v => v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Female')));
+      if (preferred) {
+        utterance.voice = preferred;
+      }
+    }
+    
     window.speechSynthesis.speak(utterance);
   }
 }
@@ -66,7 +60,6 @@ async function runCommand(text, requireWakeWord = false) {
 
 async function startListening() {
   if (polling) return;
-  // Set this before the request so a button tap cannot create a second session.
   polling = true;
   setState("Starting microphone", true);
   try {
@@ -101,7 +94,7 @@ async function pollForSpeech() {
     const event = await (await fetch("/api/listen/result")).json();
     if (event.status === "starting" || event.status === "listening") {
       setState(event.status === "starting" ? "Starting microphone" : "Listening", true);
-      setTimeout(pollForSpeech, 400);
+      setTimeout(pollForSpeech, 100);
       return;
     }
     if (event.status === "wake_detected") {
@@ -126,12 +119,47 @@ async function pollForSpeech() {
   polling = false;
 }
 
+async function pollStatusUpdates() {
+  try {
+    const res = await (await fetch("/api/status")).json();
+    androidAvailable = res.android_available;
+    if (res.settings && res.settings.speech_speed) {
+      speechSpeed = parseFloat(res.settings.speech_speed);
+    }
+    // Check if background assistant processed a command
+    if (res.last_update_id !== undefined && res.last_update_id > lastUpdateId) {
+      // First update on load should not trigger speaking/alerting
+      if (lastUpdateId !== 0) {
+        if (res.last_response) {
+          responseText.textContent = res.last_response;
+          speakText(res.last_response);
+        }
+        if (res.last_transcript) {
+          commandInput.value = res.last_transcript;
+        }
+      }
+      lastUpdateId = res.last_update_id;
+    }
+  } catch (err) {
+    console.error("Could not fetch status update:", err);
+  }
+  setTimeout(pollStatusUpdates, 1000);
+}
+
 document.querySelector("#sendButton").addEventListener("click", () => runCommand(commandInput.value.trim()));
 commandInput.addEventListener("keydown", (event) => { if (event.key === "Enter") runCommand(commandInput.value.trim()); });
 document.querySelector("#listenButton").addEventListener("click", startListening);
 document.querySelector("#offlineListenButton").addEventListener("click", toggleOfflineListening);
 document.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => runCommand(button.dataset.command)));
 
+// Ensure voices are loaded for SpeechSynthesis
+if ('speechSynthesis' in window) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => {
+    window.speechSynthesis.getVoices();
+  };
+}
+
 requestStartupPermissions().finally(() => {
-  checkAndroidStatus().finally(startListening);
+  pollStatusUpdates();
 });

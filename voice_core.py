@@ -251,22 +251,37 @@ class ContactMatcher:
 
     @classmethod
     def match(cls, spoken_name: str, contacts: list[dict[str, str]]) -> dict[str, str] | None:
-        query = cls._normalise_name(spoken_name)
-        choices = {
-            cls._normalise_name(contact.get("name", "")): contact
-            for contact in contacts
-            if contact.get("name") and contact.get("phone_number")
-        }
-        choices = {name: contact for name, contact in choices.items() if name}
-        if not query or not choices:
-            return None
-        result = process.extractOne(query, list(choices), scorer=fuzz.token_set_ratio, score_cutoff=75)
-        if result is None:
-            return None
-        matched_name, score, _index = result
-        match = dict(choices[matched_name])
-        match["score"] = str(round(score))
-        return match
+        matches = cls.find_matches(spoken_name, contacts)
+        return matches[0] if matches else None
+
+    @classmethod
+    def find_matches(cls, spoken_name: str, contacts: list[dict[str, str]]) -> list[dict[str, str]]:
+        query = cls._normalise_name(spoken_name).strip()
+        if not query or not contacts:
+            return []
+
+        matches = []
+        seen = set()
+        for contact in contacts:
+            name = contact.get("name", "")
+            number = contact.get("phone_number", "")
+            if not name or not number:
+                continue
+            norm_name = cls._normalise_name(name)
+            ratio = fuzz.token_set_ratio(query, norm_name)
+            is_substring = query in norm_name or norm_name in query
+
+            if is_substring or ratio >= 80:
+                key = (name, number)
+                if key not in seen:
+                    seen.add(key)
+                    matches.append({
+                        "name": name,
+                        "phone_number": number,
+                        "score": ratio
+                    })
+        matches.sort(key=lambda x: x["score"], reverse=True)
+        return matches
 
     @classmethod
     def _normalise_name(cls, value: str) -> str:
@@ -282,6 +297,13 @@ class AssistantService:
         self.parser, self.wake_detector, self.pending = IntentParser(), WakeWordDetector(default_wake_word), None
         self._follow_up_until = 0.0
 
+        # Disambiguation and update status properties
+        self.pending_contacts = []
+        self.waiting_for_contact_selection = False
+        self.last_transcript = ""
+        self.last_response = ""
+        self.last_update_id = 0
+
     def arm_follow_up(self, timeout_seconds: int) -> None:
         self._follow_up_until = time.monotonic() + max(2, min(15, timeout_seconds))
 
@@ -289,22 +311,39 @@ class AssistantService:
         active = time.monotonic() <= self._follow_up_until
         self._follow_up_until = 0.0
         return active
-    def handle_text(self, text: str, require_wake_word: bool = False) -> dict[str, Any]:
+
+    def handle_text(self, text: str, require_wake_word: bool = False, is_offline_service: bool = False) -> dict[str, Any]:
         started, settings = time.monotonic(), self.settings_service.get()
         woke, command = self.wake_detector.remove_wake_word(text, settings.wake_word)
         if require_wake_word and not woke:
             return self._response(ActionResult(False, f"Say {settings.wake_word} first.", IntentType.UNKNOWN), None)
         if woke:
             self.bridge.signal_wake(settings.wake_feedback_mode)
-        intent = self.parser.parse(command)
-        if intent.intent_type == IntentType.CONFIRM_ACTION:
-            result = self._confirm()
-        elif intent.intent_type == IntentType.CANCEL_ACTION:
-            self.pending, result = None, ActionResult(True, "Cancelled.", intent.intent_type)
+
+        # Check if we are waiting for contact selection!
+        if self.waiting_for_contact_selection and self.pending_contacts:
+            result = self._handle_contact_selection(command)
+            intent = ParsedIntent(IntentType.CALL_CONTACT, text, confidence=0.95)
         else:
-            result = self._prepare(intent, settings)
+            intent = self.parser.parse(command)
+            if intent.intent_type == IntentType.CONFIRM_ACTION:
+                result = self._confirm()
+            elif intent.intent_type == IntentType.CANCEL_ACTION:
+                self.pending, result = None, ActionResult(True, "Cancelled.", intent.intent_type)
+                self.waiting_for_contact_selection = False
+                self.pending_contacts = []
+            else:
+                result = self._prepare(intent, settings)
+
+        self.last_transcript = text
+        self.last_response = result.spoken_response
+        self.last_update_id += 1
+
         try:
-            self.bridge.speak(result.spoken_response, settings.speech_speed)
+            # Only speak using native TTS if triggered from background service.
+            # In foreground, WebView's JS speech synthesis is used.
+            if is_offline_service:
+                self.bridge.speak(result.spoken_response, settings.speech_speed)
         except Exception:
             self.logger.exception("Speech output failed")
         try:
@@ -330,8 +369,48 @@ class AssistantService:
         intent, self.pending = self.pending, None
         return self._execute(intent)
 
+    def _handle_contact_selection(self, command: str) -> ActionResult:
+        # Check if the user wants to cancel
+        cleaned = command.lower().strip()
+        if cleaned in {"cancel", "no", "stop", "nahi", "nahin", "ruko"}:
+            self.waiting_for_contact_selection = False
+            self.pending_contacts = []
+            return ActionResult(True, "Cancelled.", IntentType.CANCEL_ACTION)
+
+        choices = {contact["name"].lower(): contact for contact in self.pending_contacts}
+        index_match = None
+
+        # Word maps for numbers
+        word_to_idx = {
+            "first": 0, "1st": 0, "one": 0, "1": 0, "pehla": 0, "pehli": 0,
+            "second": 1, "2nd": 1, "two": 1, "2": 1, "dusra": 1, "dusri": 1,
+            "third": 2, "3rd": 2, "three": 2, "3": 2, "tisra": 2, "tisri": 2,
+        }
+        for word, idx in word_to_idx.items():
+            if word in cleaned and idx < len(self.pending_contacts):
+                index_match = self.pending_contacts[idx]
+                break
+
+        if index_match:
+            contact = index_match
+        else:
+            result = process.extractOne(cleaned, list(choices.keys()), scorer=fuzz.token_set_ratio, score_cutoff=70)
+            if result:
+                contact = choices[result[0]]
+            else:
+                contact = None
+
+        if contact:
+            self.waiting_for_contact_selection = False
+            self.pending_contacts = []
+            return self._result(self.bridge.call_number(contact["phone_number"]), f"Calling {contact['name']}.", IntentType.CALL_CONTACT)
+        else:
+            names_str = ", ".join(c["name"] for c in self.pending_contacts)
+            return ActionResult(False, f"I didn't get that. Please say one of: {names_str}, or say cancel.", IntentType.CALL_CONTACT, True)
+
     def _execute(self, intent: ParsedIntent) -> ActionResult:
         kind = intent.intent_type
+        settings = self.settings_service.get()
         if kind == IntentType.HELP:
             return ActionResult(True, "You can call, send a message, control torch, brightness, volume, WiFi, Bluetooth, hotspot, camera, or battery.", kind)
         if kind == IntentType.BATTERY_STATUS:
@@ -341,35 +420,91 @@ class AssistantService:
         if kind == IntentType.READ_NOTIFICATIONS:
             return ActionResult(True, self.bridge.read_notification(), kind)
         if kind == IntentType.CALL_CONTACT:
-            contact = self._resolve_contact(intent.entities)
-            if contact is None:
-                return ActionResult(False, f"I could not find {intent.entities.get('contact_name', 'that contact')} in your contacts.", kind)
+            spoken_name = intent.entities.get("contact_name", "")
+            direct_number = re.sub(r"[^0-9+]", "", intent.entities.get("phone_number", ""))
+            if direct_number:
+                return self._result(self.bridge.call_number(direct_number), f"Calling {spoken_name or direct_number}.", kind)
+
+            contacts = self.bridge.list_contacts()
+            matches = ContactMatcher.find_matches(spoken_name, contacts)
+
+            if not matches:
+                return ActionResult(False, f"I could not find {spoken_name or 'that contact'} in your contacts.", kind)
+
+            if len(matches) > 1:
+                # Check if the top match is high confidence and much better than the second
+                top_score = matches[0]["score"]
+                second_score = matches[1]["score"]
+                if top_score >= 95 and (top_score - second_score) >= 15:
+                    contact = matches[0]
+                    try:
+                        self.contacts_repository.increment_usage(contact["name"], contact["phone_number"])
+                    except Exception:
+                        pass
+                    return self._result(self.bridge.call_number(contact["phone_number"]), f"Calling {contact['name']}.", kind)
+
+                self.pending_contacts = matches
+                self.waiting_for_contact_selection = True
+                self.arm_follow_up(settings.wake_timeout_seconds)
+
+                names_list = [c["name"] for c in matches[:4]]
+                names_str = " or ".join(names_list)
+                return ActionResult(True, f"I found multiple contacts: {names_str}. Which one would you like to call?", kind, True)
+
+            contact = matches[0]
+            try:
+                self.contacts_repository.increment_usage(contact["name"], contact["phone_number"])
+            except Exception:
+                pass
             return self._result(self.bridge.call_number(contact["phone_number"]), f"Calling {contact['name']}.", kind)
+
         if kind == IntentType.SEND_SMS:
-            contact = self._resolve_contact(intent.entities)
-            if contact is None:
-                return ActionResult(False, f"I could not find {intent.entities.get('contact_name', 'that contact')} in your contacts.", kind)
-            return self._result(self.bridge.send_sms(contact["phone_number"], intent.entities.get("message", "")), f"Message sent to {contact['name']}.", kind)
+            spoken_name = intent.entities.get("contact_name", "")
+            message = intent.entities.get("message", "")
+            contacts = self.bridge.list_contacts()
+            matches = ContactMatcher.find_matches(spoken_name, contacts)
+
+            if not matches:
+                return ActionResult(False, f"I could not find {spoken_name or 'that contact'} in your contacts.", kind)
+
+            contact = matches[0]
+            try:
+                self.contacts_repository.increment_usage(contact["name"], contact["phone_number"])
+            except Exception:
+                pass
+            return self._result(self.bridge.send_sms(contact["phone_number"], message), f"Message sent to {contact['name']}.", kind)
+
         if kind == IntentType.BRIGHTNESS_SET:
             value = max(0, min(100, int(intent.entities.get("percentage", "50"))))
             return self._result(self.bridge.set_brightness(value), f"Brightness set to {value} percent.", kind)
+
         actions = {
-            IntentType.FLASHLIGHT_ON: (lambda: self.bridge.set_flashlight(True), "Torch on."), IntentType.FLASHLIGHT_OFF: (lambda: self.bridge.set_flashlight(False), "Torch off."),
-            IntentType.BRIGHTNESS_UP: (lambda: self.bridge.adjust_brightness("up"), "Brightness increased."), IntentType.BRIGHTNESS_DOWN: (lambda: self.bridge.adjust_brightness("down"), "Brightness decreased."),
-            IntentType.VOLUME_UP: (lambda: self.bridge.adjust_volume("up"), "Volume increased."), IntentType.VOLUME_DOWN: (lambda: self.bridge.adjust_volume("down"), "Volume decreased."), IntentType.VOLUME_MUTE: (lambda: self.bridge.adjust_volume("mute"), "Volume muted."),
-            IntentType.WIFI_ON: (lambda: self.bridge.set_wifi(True), "WiFi controls opened. Android requires you to change it there."), IntentType.WIFI_OFF: (lambda: self.bridge.set_wifi(False), "WiFi controls opened. Android requires you to change it there."),
-            IntentType.BLUETOOTH_ON: (lambda: self.bridge.set_bluetooth(True), "Bluetooth controls opened. Android requires you to change it there."), IntentType.BLUETOOTH_OFF: (lambda: self.bridge.set_bluetooth(False), "Bluetooth controls opened. Android requires you to change it there."),
-            IntentType.HOTSPOT_ON: (lambda: self.bridge.set_hotspot(True), "Hotspot controls opened. Android requires you to change it there."), IntentType.HOTSPOT_OFF: (lambda: self.bridge.set_hotspot(False), "Hotspot controls opened. Android requires you to change it there."),
-            IntentType.OPEN_CAMERA: (lambda: self.bridge.open_application("camera"), "Camera opened."), IntentType.CLOSE_APP: (lambda: self.bridge.close_application(), "Application closed."),
+            IntentType.FLASHLIGHT_ON: (lambda: self.bridge.set_flashlight(True), "Torch on."),
+            IntentType.FLASHLIGHT_OFF: (lambda: self.bridge.set_flashlight(False), "Torch off."),
+            IntentType.BRIGHTNESS_UP: (lambda: self.bridge.adjust_brightness("up"), "Brightness increased."),
+            IntentType.BRIGHTNESS_DOWN: (lambda: self.bridge.adjust_brightness("down"), "Brightness decreased."),
+            IntentType.VOLUME_UP: (lambda: self.bridge.adjust_volume("up"), "Volume increased."),
+            IntentType.VOLUME_DOWN: (lambda: self.bridge.adjust_volume("down"), "Volume decreased."),
+            IntentType.VOLUME_MUTE: (lambda: self.bridge.adjust_volume("mute"), "Volume muted."),
+            IntentType.WIFI_ON: (lambda: self.bridge.set_wifi(True), "WiFi controls opened. Android requires you to change it there."),
+            IntentType.WIFI_OFF: (lambda: self.bridge.set_wifi(False), "WiFi controls opened. Android requires you to change it there."),
+            IntentType.BLUETOOTH_ON: (lambda: self.bridge.set_bluetooth(True), "Bluetooth controls opened. Android requires you to change it there."),
+            IntentType.BLUETOOTH_OFF: (lambda: self.bridge.set_bluetooth(False), "Bluetooth controls opened. Android requires you to change it there."),
+            IntentType.HOTSPOT_ON: (lambda: self.bridge.set_hotspot(True), "Hotspot controls opened. Android requires you to change it there."),
+            IntentType.HOTSPOT_OFF: (lambda: self.bridge.set_hotspot(False), "Hotspot controls opened. Android requires you to change it there."),
+            IntentType.OPEN_CAMERA: (lambda: self.bridge.open_application("camera"), "Camera opened."),
+            IntentType.CLOSE_APP: (lambda: self.bridge.close_application(), "Application closed."),
         }
         if kind in actions:
             operation, text = actions[kind]
             return self._result(operation(), text, kind)
         return ActionResult(False, "That command is not available yet.", kind)
 
-    @staticmethod
-    def _result(success: bool, text: str, kind: IntentType) -> ActionResult:
-        return ActionResult(bool(success), text if success else "I could not complete that action.", kind)
+    def _result(self, bridge_result: tuple[bool, str] | bool, default_success_text: str, kind: IntentType) -> ActionResult:
+        if isinstance(bridge_result, tuple):
+            success, message = bridge_result
+            return ActionResult(success, message, kind)
+        return ActionResult(bool(bridge_result), default_success_text if bridge_result else "I could not complete that action.", kind)
 
     def _resolve_contact(self, entities: dict[str, str]) -> dict[str, str] | None:
         spoken_name = entities.get("contact_name", "")
@@ -388,6 +523,7 @@ class AssistantService:
         except Exception:
             self.logger.exception("Could not record contact usage")
         return match
+
     @staticmethod
     def _response(result: ActionResult, intent: ParsedIntent | None) -> dict[str, Any]:
         return {"success": result.success, "response": result.spoken_response, "intent": result.intent_type.value, "confidence": intent.confidence if intent else 0.0, "entities": intent.entities if intent else {}, "needs_confirmation": result.needs_confirmation}
