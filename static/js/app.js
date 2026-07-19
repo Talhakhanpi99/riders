@@ -58,13 +58,19 @@ async function runCommand(text, requireWakeWord = false) {
   } catch { responseText.textContent = "I could not reach the assistant."; setState("Offline"); }
 }
 
-async function startListening() {
+async function startListening(retryCount = 0) {
   if (polling) return;
   polling = true;
-  setState("Starting microphone", true);
+  setState(retryCount > 0 ? "Loading speech engine" : "Starting microphone", true);
   try {
     const response = await fetch("/api/listen/start", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({timeout_seconds: 5})});
     const state = await response.json();
+    if (state.status === "loading" && retryCount < 12) {
+      responseText.textContent = state.message || "Offline speech engine is starting...";
+      polling = false;
+      setTimeout(() => startListening(retryCount + 1), 2000);
+      return;
+    }
     if (!state.started) throw new Error(state.message || "Microphone could not start.");
     pollForSpeech();
   } catch (error) {
@@ -81,10 +87,10 @@ async function toggleOfflineListening() {
     if (!payload.started && !payload.stopped) throw new Error(payload.message || "Offline listener could not be changed.");
     offlineListening = Boolean(payload.started) && !payload.stopped;
     document.querySelector("#offlineListenButton").textContent = offlineListening ? "Stop Offline Listening" : "Start Offline Listening";
-    responseText.textContent = payload.message || (offlineListening ? "Offline listening started." : "Offline listening stopped.");
+    responseText.textContent = payload.message || (offlineListening ? "Offline listening started. Check adb logcat for VOICERIDE [LISTENER] lines." : "Offline listening stopped.");
     setState(offlineListening ? "Offline listening" : "Ready", offlineListening);
   } catch (error) {
-    responseText.textContent = error.message || "Offline listener could not be changed.";
+    responseText.textContent = (error.message || "Offline listener could not be changed.") + " Check adb logcat for VOICERIDE [SERVICE] lines.";
   }
 }
 
@@ -92,6 +98,11 @@ async function pollForSpeech() {
   if (!polling) return;
   try {
     const event = await (await fetch("/api/listen/result")).json();
+    if (event.status === "loading") {
+      setState("Loading speech engine", true);
+      setTimeout(pollForSpeech, 500);
+      return;
+    }
     if (event.status === "starting" || event.status === "listening") {
       setState(event.status === "starting" ? "Starting microphone" : "Listening", true);
       setTimeout(pollForSpeech, 100);

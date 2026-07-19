@@ -1,10 +1,12 @@
-"""Android-specific bridge code kept out of the top-level android namespace."""
+﻿"""Android-specific bridge code kept out of the top-level android namespace."""
 
 from __future__ import annotations
 
 import logging
 import threading
 from typing import Any
+
+from diag_log import log
 
 WEBVIEW_INSTANCE: Any | None = None
 
@@ -63,17 +65,20 @@ try:
             TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
             Locale = autoclass("java.util.Locale")
             self.bridge._tts_ready = status == TextToSpeech.SUCCESS
+            log("TTS", "onInit callback | status=%s ready=%s", status, self.bridge._tts_ready)
             if not self.bridge._tts_ready:
                 self.bridge.logger.error("Android TextToSpeech initialisation failed: %s", status)
                 return
             try:
                 self.bridge._tts.setLanguage(Locale.US)
+                log("TTS", "Language set to Locale.US")
             except Exception as e:
                 self.bridge.logger.exception("Failed to set TTS language to Locale.US: %s", e)
             self.bridge.logger.info("Android TextToSpeech is ready")
             if self.bridge._tts_pending is not None:
                 pending_text, pending_speed = self.bridge._tts_pending
                 self.bridge._tts_pending = None
+                log("TTS", "Flushing pending speech (%d chars)", len(pending_text))
                 self.bridge._speak_now(pending_text, pending_speed)
 
     class SpeechRecognitionListener(PythonJavaClass):
@@ -155,6 +160,7 @@ try:
 
         @java_method("(Ljava/lang/Exception;)V")
         def onError(self, error: object) -> None:
+            log("VOSK", "StorageService.unpack onError: %s", error, level=logging.ERROR)
             self.logger.error("Could not unpack the local Vosk model: %s", error)
             self.ready.set()
 
@@ -224,6 +230,7 @@ class AndroidNativeBridge:
         self._speech_lock = threading.Lock()
         self._vosk_model: Any = None
         self._vosk_loading: bool = False
+        self._vosk_error: str | None = None
         self._vosk_speech_service: Any = None
 
         try:
@@ -246,8 +253,9 @@ class AndroidNativeBridge:
                 self.logger.info("Android bridge running in desktop fallback mode")
 
         if self.android_available:
+            log("BRIDGE", "Android bridge ready | activity=%s", type(self._activity).__name__)
             # Start loading Vosk model in a background thread
-            threading.Thread(target=self._load_vosk_model, daemon=True).start()
+            threading.Thread(target=self._load_vosk_model, daemon=True, name="vosk-loader").start()
 
             # Initialize TTS early
             try:
@@ -266,6 +274,7 @@ class AndroidNativeBridge:
                             TextToSpeech = self._class("android.speech.tts.TextToSpeech")
                             self._tts_listener = TtsInitListener(self)
                             self._tts = TextToSpeech(self._activity, self._tts_listener)
+                            log("TTS", "TextToSpeech constructor called on UI thread")
                         except Exception as e:
                             self.logger.exception("Failed to initialize TTS on startup: %s", e)
                     init_tts()
@@ -273,30 +282,75 @@ class AndroidNativeBridge:
                     TextToSpeech = self._class("android.speech.tts.TextToSpeech")
                     self._tts_listener = TtsInitListener(self)
                     self._tts = TextToSpeech(self._activity, self._tts_listener)
+                    log("TTS", "TextToSpeech constructor called from service context")
             except Exception as e:
                 self.logger.exception("Failed to schedule TTS initialization: %s", e)
+        else:
+            log("BRIDGE", "Running in desktop fallback mode (no Android activity)")
 
     def _load_vosk_model(self) -> None:
+        """Load the Vosk speech recognition model.
+
+        Tries two strategies in order:
+          1. Direct Model(path) using the extracted asset dir (fastest, most reliable).
+          2. StorageService.unpack() as fallback (copies from APK assets first).
+
+        Every step is logged so `adb logcat | findstr python` shows exactly what happens.
+        """
+        if self._vosk_loading:
+            log("VOSK", "Load already in progress, skipping duplicate start.")
+            return
+        self._vosk_loading = True
+        self._vosk_error = None
         try:
-            self._vosk_loading = True
-            self.logger.info("Starting background loading of Vosk model...")
+            log("VOSK", "=== Starting Vosk model load ===")
             from jnius import autoclass
+            log("VOSK", "jnius imported successfully")
+
+            files_dir = str(self._activity.getFilesDir().getAbsolutePath())
+            model_path = f"{files_dir}/model-en-us"
+            log("VOSK", "Looking for model at: %s", model_path)
+
+            import os
+            if os.path.isdir(model_path):
+                log("VOSK", "Model directory exists - attempting direct Model() load")
+                try:
+                    Model = autoclass("org.vosk.Model")
+                    self._vosk_model = Model(model_path)
+                    log("VOSK", "Model loaded directly from path - SUCCESS")
+                    return
+                except Exception as direct_exc:
+                    log("VOSK", "Direct Model() load failed: %s - trying StorageService.unpack()", direct_exc, level=logging.WARNING)
+            else:
+                log("VOSK", "Model directory NOT found at %s - will unpack from APK assets", model_path)
+
+            log("VOSK", "Loading StorageService...")
             StorageService = autoclass("org.vosk.android.StorageService")
+            log("VOSK", "StorageService loaded - calling unpack('model-en-us', 'model-en-us')")
 
             ready = threading.Event()
             loaded_model: list[object] = []
             callback = VoskModelCallback(loaded_model, ready, self.logger)
 
             StorageService.unpack(self._activity, "model-en-us", "model-en-us", callback)
-            if ready.wait(45) and loaded_model:
-                self._vosk_model = loaded_model[0]
-                self.logger.info("Vosk model successfully loaded in main app process.")
+            log("VOSK", "unpack() called - waiting up to 60 seconds for callback...")
+
+            if ready.wait(60):
+                if loaded_model:
+                    self._vosk_model = loaded_model[0]
+                    log("VOSK", "StorageService.unpack() succeeded - model ready")
+                else:
+                    log("VOSK", "StorageService.unpack() callback fired but model list is empty - onError was called", level=logging.ERROR)
             else:
-                self.logger.error("Vosk model failed to load in background.")
+                log("VOSK", "StorageService.unpack() did not complete within 60 seconds - model NOT loaded", level=logging.ERROR)
         except Exception as exc:
-            self.logger.exception("Error loading Vosk model: %s", exc)
+            self._vosk_error = str(exc)
+            log("VOSK", "Unexpected error loading Vosk model: %s", exc, level=logging.ERROR)
+            self.logger.exception("[VOSK] Unexpected error loading Vosk model: %s", exc)
         finally:
             self._vosk_loading = False
+            status = "LOADED" if self._vosk_model is not None else "FAILED"
+            log("VOSK", "=== Model load finished: %s ===", status)
 
     def evaluate_javascript(self, js_code: str) -> None:
         global WEBVIEW_INSTANCE
@@ -356,10 +410,24 @@ class AndroidNativeBridge:
             self.logger.exception("Could not request Android permissions: %s", exc)
             return {permission: self.has_permission(permission) for permission in permissions}
 
+    def runtime_snapshot(self) -> dict[str, Any]:
+        """Expose live subsystem state for diagnostics and adb logcat correlation."""
+        return {
+            "android_available": self.android_available,
+            "vosk_status": "loaded" if self._vosk_model is not None else ("loading" if self._vosk_loading else "failed"),
+            "vosk_loading": self._vosk_loading,
+            "vosk_error": self._vosk_error,
+            "tts_ready": self._tts_ready,
+            "tts_pending": self._tts_pending is not None,
+            "speech_state": self._speech_state,
+        }
+
     def speak(self, text: str, speech_speed: float = 1.0) -> None:
         """Speak feedback after Android TextToSpeech has finished initialising."""
-        self.logger.info("TTS response: %s | speed=%s", text, speech_speed)
+        preview = (text[:80] + "...") if len(text) > 80 else text
+        log("TTS", "speak() called | ready=%s pending=%s speed=%s text=%r", self._tts_ready, self._tts_pending is not None, speech_speed, preview)
         if not self.android_available or not text:
+            log("TTS", "speak() skipped | android=%s text_empty=%s", self.android_available, not bool(text), level=logging.WARNING)
             return
         try:
             from android.runnable import run_on_ui_thread  # type: ignore
@@ -368,17 +436,20 @@ class AndroidNativeBridge:
             def speak_on_ui_thread() -> None:
                 TextToSpeech = self._class("android.speech.tts.TextToSpeech")
                 if self._tts is None:
+                    log("TTS", "TTS engine not created yet - queueing speech and initializing")
                     self._tts_pending = (text, speech_speed)
                     self._tts_listener = TtsInitListener(self)
                     self._tts = TextToSpeech(self._activity, self._tts_listener)
                     return
                 if not self._tts_ready:
+                    log("TTS", "TTS not ready yet - queueing speech")
                     self._tts_pending = (text, speech_speed)
                     return
                 self._speak_now(text, speech_speed)
 
             speak_on_ui_thread()
         except Exception as exc:
+            log("TTS", "speak() failed: %s", exc, level=logging.ERROR)
             self.logger.exception("Android TTS failed: %s", exc)
 
     def speech_diagnostic(self) -> dict[str, Any]:
@@ -393,6 +464,7 @@ class AndroidNativeBridge:
             return {"ok": False, "message": f"TTS test failed: {exc}"}
     def _speak_now(self, text: str, speech_speed: float) -> None:
         if self._tts is None or not self._tts_ready:
+            log("TTS", "_speak_now skipped | tts=%s ready=%s", self._tts is not None, self._tts_ready, level=logging.WARNING)
             return
         TextToSpeech = self._class("android.speech.tts.TextToSpeech")
         Bundle = self._class("android.os.Bundle")
@@ -400,7 +472,10 @@ class AndroidNativeBridge:
         self._tts.setSpeechRate(max(0.7, min(1.3, speech_speed)))
         result = self._tts.speak(text, TextToSpeech.QUEUE_FLUSH, bundle, "voiceride")
         if result == TextToSpeech.ERROR:
+            log("TTS", "TextToSpeech.speak() returned ERROR", level=logging.ERROR)
             self.logger.error("Android TextToSpeech rejected speech output")
+        else:
+            log("TTS", "TextToSpeech.speak() accepted (%d chars)", len(text))
     def signal_wake(self, mode: str) -> bool:
         if mode == "torch_blink":
             return self._blink_torch()
@@ -673,15 +748,20 @@ class AndroidNativeBridge:
 
         if self._vosk_model is None:
             if self._vosk_loading:
+                log("MIC", "Vosk model still loading - microphone request delayed")
                 return {"started": False, "status": "loading", "message": "Offline speech engine is initializing. Please wait a moment."}
-            else:
-                threading.Thread(target=self._load_vosk_model, daemon=True).start()
-                return {"started": False, "status": "loading", "message": "Offline speech engine is starting up. Please try again in a few seconds."}
+            if self._vosk_error:
+                log("MIC", "Vosk model unavailable after load failure: %s", self._vosk_error, level=logging.ERROR)
+                return {"started": False, "status": "error", "message": f"Offline speech engine failed to start: {self._vosk_error}"}
+            log("MIC", "Vosk model not loaded - starting background load now")
+            threading.Thread(target=self._load_vosk_model, daemon=True, name="vosk-loader-retry").start()
+            return {"started": False, "status": "loading", "message": "Offline speech engine is starting up. Please try again in a few seconds."}
 
         try:
             from jnius import autoclass
             Recognizer = autoclass("org.vosk.Recognizer")
             SpeechService = autoclass("org.vosk.android.SpeechService")
+            log("MIC", "Starting Vosk SpeechService listening session (timeout=%ss)", timeout_seconds)
 
             with self._speech_lock:
                 self._speech_result, self._speech_error = None, None
@@ -719,6 +799,7 @@ class AndroidNativeBridge:
                 listener = VoskRecognitionCallback(on_result, on_error)
                 self._vosk_speech_service = SpeechService(recognizer, 16000.0)
                 self._vosk_speech_service.startListening(listener)
+                log("MIC", "Vosk SpeechService.startListening() succeeded")
 
             def safety_timeout() -> None:
                 with self._speech_lock:
@@ -732,59 +813,103 @@ class AndroidNativeBridge:
             threading.Timer(float(timeout_seconds), safety_timeout).start()
             return {"started": True, "status": "listening"}
         except Exception as exc:
+            log("MIC", "Could not start Vosk listening: %s", exc, level=logging.ERROR)
             self.logger.exception("Could not start offline Vosk listening: %s", exc)
             return {"started": False, "status": "error", "message": f"Could not start local offline listener: {exc}"}
 
     def start_offline_listener(self) -> dict[str, Any]:
         """Start the bundled Vosk foreground service from the visible activity."""
+        log("SERVICE", "start_offline_listener() called")
         if not self.android_available:
+            log("SERVICE", "Android not available - cannot start service", level=logging.WARNING)
             return {"started": False, "status": "unavailable", "message": "Offline listening is available on Android only."}
         microphone = "android.permission.RECORD_AUDIO"
         if not self.request_permissions([microphone]).get(microphone):
+            log("SERVICE", "Microphone permission denied", level=logging.WARNING)
             return {"started": False, "status": "permission_denied", "message": "Microphone permission is required."}
         try:
             from pathlib import Path
-            Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").unlink(missing_ok=True)
-            
-            import threading
+            files_dir = str(self._activity.getFilesDir().getAbsolutePath())
+            stop_marker = Path(files_dir, "offline_listener.stop")
+            stop_marker.unlink(missing_ok=True)
+            log("SERVICE", "Stop marker cleared from: %s", stop_marker)
+
             completed = threading.Event()
             error_container: list[Exception] = []
-            
+            class_name_used: list[str] = []
+
             from android.runnable import run_on_ui_thread  # type: ignore
-            
+
             @run_on_ui_thread
             def run_on_android_ui_thread() -> None:
                 try:
-                    from jnius import autoclass
                     package_name = self._activity.getPackageName()
-                    ServiceClass = autoclass(f"{package_name}.ServiceListener")
+                    log("SERVICE", "Package name: %s", package_name)
+
+                    try:
+                        from android import start_service  # type: ignore
+                        log("SERVICE", "Trying android.start_service('Listener')")
+                        start_service("Listener")
+                        class_name_used.append("android.start_service('Listener')")
+                        log("SERVICE", "android.start_service('Listener') succeeded")
+                        return
+                    except Exception as module_exc:
+                        log("SERVICE", "android.start_service failed: %s", module_exc, level=logging.WARNING)
+
+                    target_class = f"{package_name}.ServiceListener"
+                    class_name_used.append(target_class)
+                    log("SERVICE", "Trying autoclass(%s)", target_class)
+                    from jnius import autoclass
+                    ServiceClass = autoclass(target_class)
+                    log("SERVICE", "Class loaded - calling ServiceClass.start()")
                     ServiceClass.start(self._activity, "")
+                    log("SERVICE", "ServiceClass.start() succeeded")
                 except Exception as e:
+                    log("SERVICE", "Failed to start service: %s", e, level=logging.ERROR)
+                    self.logger.exception("[SERVICE] Failed to start service: %s", e)
+                    if class_name_used:
+                        log("SERVICE", "Methods tried: %s", class_name_used, level=logging.ERROR)
                     error_container.append(e)
                 finally:
                     completed.set()
-            
+
             run_on_android_ui_thread()
-            
-            if not completed.wait(timeout=5.0):
-                return {"started": False, "status": "error", "message": "Timeout starting offline listening on main thread."}
-            
+            log("SERVICE", "Waiting for service start on UI thread (10s timeout)...")
+
+            if not completed.wait(timeout=10.0):
+                log("SERVICE", "Timed out waiting for service start on UI thread", level=logging.ERROR)
+                return {"started": False, "status": "error", "message": "Timeout starting offline listening. Check that the app was built with the Listener service registered in buildozer.spec."}
+
             if error_container:
                 raise error_container[0]
-                
-            return {"started": True, "status": "starting", "message": "Offline listening is starting."}
+
+            log("SERVICE", "start_offline_listener() completed successfully")
+            return {"started": True, "status": "starting", "message": "Background assistant is starting. You will hear a response when it is ready."}
         except Exception as exc:
-            self.logger.exception("Could not start offline listener: %s", exc)
-            return {"started": False, "status": "error", "message": f"Could not start offline listening: {exc}"}
+            log("SERVICE", "Could not start offline listener: %s", exc, level=logging.ERROR)
+            self.logger.exception("[SERVICE] Could not start offline listener: %s", exc)
+            err_msg = str(exc)
+            if "ClassNotFoundException" in err_msg or "ClassNotFound" in err_msg:
+                hint = f"The service class was not found: {err_msg}. This usually means the APK was not built with 'services = Listener:offline_listener_service.py:foreground:sticky' in buildozer.spec, or the build is outdated."
+            elif "SecurityException" in err_msg:
+                hint = f"Android blocked the service start: {err_msg}. FOREGROUND_SERVICE permission may be missing."
+            else:
+                hint = f"Service start failed: {err_msg}"
+            return {"started": False, "status": "error", "message": hint}
+
 
     def stop_offline_listener(self) -> dict[str, Any]:
+        log("SERVICE", "stop_offline_listener() called")
         if not self.android_available:
             return {"stopped": True, "status": "unavailable"}
         try:
             from pathlib import Path
-            Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").touch()
+            stop_path = Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop")
+            stop_path.touch()
+            log("SERVICE", "Stop marker written: %s", stop_path)
             return {"stopped": True, "status": "stopping", "message": "Offline listener is stopping."}
         except Exception as exc:
+            log("SERVICE", "Could not stop offline listener: %s", exc, level=logging.ERROR)
             self.logger.exception("Could not stop offline listener: %s", exc)
             return {"stopped": False, "status": "error", "message": "Could not stop offline listening."}
     def consume_speech_result(self) -> dict[str, str]:
@@ -792,10 +917,12 @@ class AndroidNativeBridge:
             if self._speech_result is not None:
                 value, self._speech_result = self._speech_result, None
                 self._speech_state = "idle"
+                log("MIC", "Speech result consumed: %r", value)
                 return {"status": "result", "transcript": value}
             if self._speech_error is not None:
                 value, self._speech_error = self._speech_error, None
                 self._speech_state = "idle"
+                log("MIC", "Speech error consumed: %s", value, level=logging.WARNING)
                 return {"status": "error", "message": value}
             return {"status": self._speech_state}
 
@@ -832,4 +959,5 @@ class AndroidNativeBridge:
         except Exception as exc:
             self.logger.exception("Android vibration failed: %s", exc)
             return False
+
 

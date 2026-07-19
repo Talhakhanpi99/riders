@@ -10,6 +10,8 @@ from typing import Any
 
 from rapidfuzz import fuzz, process
 
+from diag_log import log
+
 
 class IntentType(str, Enum):
     UNKNOWN = "unknown"
@@ -340,10 +342,11 @@ class AssistantService:
         self.last_update_id += 1
 
         try:
-            # Only speak using native TTS if triggered from background service.
-            # In foreground, WebView's JS speech synthesis is used.
-            if is_offline_service:
-                self.bridge.speak(result.spoken_response, settings.speech_speed)
+            # Always call native TTS so the background service speaks.
+            # In the foreground WebView, app.js also calls speechSynthesis — but native TTS
+            # is kept here as a reliable fallback for devices where WebView TTS is silent.
+            log("ASSISTANT", "Calling bridge.speak() | response=%r", result.spoken_response[:80])
+            self.bridge.speak(result.spoken_response, settings.speech_speed)
         except Exception:
             self.logger.exception("Speech output failed")
         try:
