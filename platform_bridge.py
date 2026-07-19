@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from diag_log import log
+from vosk_assets import unpack_model_from_assets, vosk_java_available
 
 WEBVIEW_INSTANCE: Any | None = None
 
@@ -291,11 +292,12 @@ class AndroidNativeBridge:
     def _load_vosk_model(self) -> None:
         """Load the Vosk speech recognition model.
 
-        Tries two strategies in order:
-          1. Direct Model(path) using the extracted asset dir (fastest, most reliable).
-          2. StorageService.unpack() as fallback (copies from APK assets first).
+        Tries in order:
+          1. Copy bundled assets into files dir when missing.
+          2. Direct Model(path) load from the extracted directory.
+          3. StorageService.unpack() when the Java helper is present in the APK.
 
-        Every step is logged so `adb logcat | findstr python` shows exactly what happens.
+        Every step is logged so `adb logcat | findstr VOICERIDE` shows what happened.
         """
         if self._vosk_loading:
             log("VOSK", "Load already in progress, skipping duplicate start.")
@@ -304,34 +306,45 @@ class AndroidNativeBridge:
         self._vosk_error = None
         try:
             log("VOSK", "=== Starting Vosk model load ===")
+            available, availability_error = vosk_java_available()
+            if not available:
+                raise RuntimeError(
+                    "Vosk Java classes are missing from the APK. "
+                    "Run scripts/fetch_vosk_android.sh before building. "
+                    f"Root cause: {availability_error}"
+                )
+
             from jnius import autoclass
-            log("VOSK", "jnius imported successfully")
+            log("VOSK", "org.vosk.Model is available on the classpath")
 
             files_dir = str(self._activity.getFilesDir().getAbsolutePath())
             model_path = f"{files_dir}/model-en-us"
             log("VOSK", "Looking for model at: %s", model_path)
 
             import os
-            if os.path.isdir(model_path):
-                log("VOSK", "Model directory exists - attempting direct Model() load")
-                try:
-                    Model = autoclass("org.vosk.Model")
-                    self._vosk_model = Model(model_path)
-                    log("VOSK", "Model loaded directly from path - SUCCESS")
-                    return
-                except Exception as direct_exc:
-                    log("VOSK", "Direct Model() load failed: %s - trying StorageService.unpack()", direct_exc, level=logging.WARNING)
-            else:
-                log("VOSK", "Model directory NOT found at %s - will unpack from APK assets", model_path)
+            if not os.path.isdir(model_path) or not os.listdir(model_path):
+                log("VOSK", "Model directory missing or empty - unpacking bundled assets")
+                model_path = unpack_model_from_assets(self._activity, "model-en-us", "model-en-us")
 
-            log("VOSK", "Loading StorageService...")
-            StorageService = autoclass("org.vosk.android.StorageService")
+            try:
+                Model = autoclass("org.vosk.Model")
+                self._vosk_model = Model(model_path)
+                log("VOSK", "Model loaded directly from path - SUCCESS")
+                return
+            except Exception as direct_exc:
+                log("VOSK", "Direct Model() load failed: %s - trying StorageService.unpack()", direct_exc, level=logging.WARNING)
+
+            try:
+                StorageService = autoclass("org.vosk.android.StorageService")
+            except Exception as storage_exc:
+                raise RuntimeError(
+                    f"Model files are present but org.vosk.Model failed to load: {direct_exc}"
+                ) from storage_exc
+
             log("VOSK", "StorageService loaded - calling unpack('model-en-us', 'model-en-us')")
-
             ready = threading.Event()
             loaded_model: list[object] = []
             callback = VoskModelCallback(loaded_model, ready, self.logger)
-
             StorageService.unpack(self._activity, "model-en-us", "model-en-us", callback)
             log("VOSK", "unpack() called - waiting up to 60 seconds for callback...")
 

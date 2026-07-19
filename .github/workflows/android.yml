@@ -43,6 +43,9 @@ jobs:
         run: |
           python -m pytest -q
 
+      - name: Fetch Vosk Android libraries
+        run: bash scripts/fetch_vosk_android.sh
+
       - name: Build APK
         run: |
           buildozer android debug

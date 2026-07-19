@@ -14,7 +14,7 @@ from diag_log import log
 from platform_bridge import launch_webview_if_available
 
 WEB_URL = "http://127.0.0.1:5000"
-DIAG_BUILD = "0.1.5-diag"
+DIAG_BUILD = "0.1.6"
 
 
 def run_flask() -> None:

@@ -13,11 +13,12 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from diag_log import log
+from vosk_assets import unpack_model_from_assets, vosk_java_available
 
 LOG = logging.getLogger("voiceride.listener")
 LOOPBACK_ENDPOINT = "http://127.0.0.1:5000/api/offline/transcript"
 SAMPLE_RATE = 16_000.0
-SERVICE_BUILD = "0.1.5-diag"
+SERVICE_BUILD = "0.1.6"
 
 
 def configure_service_logging() -> None:
@@ -153,21 +154,39 @@ def main() -> None:
     except Exception as exc:
         log("LISTENER", "Could not verify microphone permission: %s", exc, level=logging.WARNING, logger_name="voiceride.listener")
 
-    StorageService = autoclass("org.vosk.android.StorageService")
+    available, availability_error = vosk_java_available()
+    if not available:
+        log(
+            "LISTENER",
+            "Vosk Java classes missing from APK: %s",
+            availability_error,
+            level=logging.ERROR,
+            logger_name="voiceride.listener",
+        )
+        return
+
     Recognizer = autoclass("org.vosk.Recognizer")
     SpeechService = autoclass("org.vosk.android.SpeechService")
-    ready = threading.Event()
     loaded_model: list[object] = []
 
-    log("LISTENER", "Unpacking Vosk model from APK assets...", logger_name="voiceride.listener")
-    callback = ModelCallback(loaded_model, ready)
-    StorageService.unpack(service, "model-en-us", "model-en-us", callback)
-    if not ready.wait(45):
-        log("LISTENER", "Vosk model unpack timed out after 45s", level=logging.ERROR, logger_name="voiceride.listener")
-        return
-    if not loaded_model:
-        log("LISTENER", "Vosk model unpack failed (empty model)", level=logging.ERROR, logger_name="voiceride.listener")
-        return
+    log("LISTENER", "Preparing Vosk model from bundled assets...", logger_name="voiceride.listener")
+    try:
+        model_path = unpack_model_from_assets(service, "model-en-us", "model-en-us")
+        Model = autoclass("org.vosk.Model")
+        loaded_model.append(Model(model_path))
+        log("LISTENER", "Vosk model loaded from %s", model_path, logger_name="voiceride.listener")
+    except Exception as exc:
+        log("LISTENER", "Direct model load failed: %s - trying StorageService.unpack()", exc, level=logging.WARNING, logger_name="voiceride.listener")
+        ready = threading.Event()
+        callback = ModelCallback(loaded_model, ready)
+        StorageService = autoclass("org.vosk.android.StorageService")
+        StorageService.unpack(service, "model-en-us", "model-en-us", callback)
+        if not ready.wait(45):
+            log("LISTENER", "Vosk model unpack timed out after 45s", level=logging.ERROR, logger_name="voiceride.listener")
+            return
+        if not loaded_model:
+            log("LISTENER", "Vosk model unpack failed (empty model)", level=logging.ERROR, logger_name="voiceride.listener")
+            return
 
     stop_marker.unlink(missing_ok=True)
     log("LISTENER", "Vosk model ready - starting SpeechService", logger_name="voiceride.listener")
