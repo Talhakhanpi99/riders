@@ -85,3 +85,10 @@ def test_fuzzy_device_name_and_contact_honorific_are_resolved() -> None:
     )
     assert contact is not None
     assert contact["name"] == "Shani Zong"
+
+def test_parse_open_app_and_device_toggles() -> None:
+    parser = IntentParser()
+
+    assert parser.parse("open whatsapp").intent_type == IntentType.OPEN_APP
+    assert parser.parse("wifi off").intent_type == IntentType.WIFI_OFF
+    assert parser.parse("bluetooth on").intent_type == IntentType.BLUETOOTH_ON

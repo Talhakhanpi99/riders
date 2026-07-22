@@ -33,6 +33,7 @@ class IntentType(str, Enum):
     HOTSPOT_ON = "hotspot_on"
     HOTSPOT_OFF = "hotspot_off"
     OPEN_CAMERA = "open_camera"
+    OPEN_APP = "open_app"
     CLOSE_APP = "close_app"
     BATTERY_STATUS = "battery_status"
     READ_LATEST_SMS = "read_latest_sms"
@@ -121,6 +122,20 @@ class IntentParser:
     TURN_OFF = ("off", "close", "band", "bandh", "stop", "bnd")
     TORCH_WORDS = ("torch", "flashlight", "flash light", "light")
     BRIGHTNESS_WORDS = ("brightness", "roshni", "screen brightness")
+    APP_ALIASES = {
+        "whatsapp": "com.whatsapp",
+        "instagram": "com.instagram.android",
+        "facebook": "com.facebook.katana",
+        "youtube": "com.google.android.youtube",
+        "chrome": "com.android.chrome",
+        "maps": "com.google.android.apps.maps",
+        "gmail": "com.google.android.gm",
+        "messages": "com.google.android.apps.messaging",
+        "clock": "com.google.android.deskclock",
+        "photos": "com.google.android.apps.photos",
+        "music": "com.google.android.music",
+        "settings": "android.settings.SETTINGS",
+    }
 
     def parse(self, text: str) -> ParsedIntent:
         raw, value = text or "", self._normalise(text or "")
@@ -155,6 +170,9 @@ class IntentParser:
         toggle = self._toggle(value)
         if toggle:
             return ParsedIntent(toggle, raw, confidence=.92)
+        app = self._app_action(value)
+        if app:
+            return ParsedIntent(IntentType.OPEN_APP, raw, {"app_name": app}, .91)
         if "camera" in value and self._contains_any(value, self.TURN_ON):
             return ParsedIntent(IntentType.OPEN_CAMERA, raw, confidence=.91)
         if self._contains_any(value, ("close app", "band app", "close application", "app band")):
@@ -226,6 +244,18 @@ class IntentParser:
                 if self._contains_any(value, self.TURN_ON):
                     return on
         return None
+
+    def _app_action(self, value: str) -> str | None:
+        match = re.search(r"(?:open|launch|start|khol|kholo|chalao|chalo)\s+(?:the\s+)?([a-z0-9 _-]+)", value)
+        if not match:
+            return None
+        app_name = match.group(1).strip()
+        if not app_name:
+            return None
+        if app_name in self.APP_ALIASES:
+            return app_name
+        best = process.extractOne(app_name, list(self.APP_ALIASES), scorer=fuzz.token_set_ratio, score_cutoff=72)
+        return best[0] if best else None
 
     @staticmethod
     def _sms(value: str) -> dict[str, str] | None:
@@ -333,7 +363,7 @@ class AssistantService:
     def _execute(self, intent: ParsedIntent) -> ActionResult:
         kind = intent.intent_type
         if kind == IntentType.HELP:
-            return ActionResult(True, "You can call, send a message, control torch, brightness, volume, WiFi, Bluetooth, hotspot, camera, or battery.", kind)
+            return ActionResult(True, "You can call contacts, send SMS, control torch, brightness, volume, Wi‑Fi, Bluetooth, hotspot, camera, battery, notifications, and open apps.", kind)
         if kind == IntentType.BATTERY_STATUS:
             return ActionResult(True, f"Battery is {self.bridge.get_battery_percentage()} percent.", kind)
         if kind == IntentType.READ_LATEST_SMS:
@@ -353,13 +383,16 @@ class AssistantService:
         if kind == IntentType.BRIGHTNESS_SET:
             value = max(0, min(100, int(intent.entities.get("percentage", "50"))))
             return self._result(self.bridge.set_brightness(value), f"Brightness set to {value} percent.", kind)
+        if kind == IntentType.OPEN_APP:
+            app_name = intent.entities.get("app_name", "")
+            return self._result(self.bridge.open_application(app_name), f"Opening {app_name}.", kind)
         actions = {
-            IntentType.FLASHLIGHT_ON: (lambda: self.bridge.set_flashlight(True), "Torch on."), IntentType.FLASHLIGHT_OFF: (lambda: self.bridge.set_flashlight(False), "Torch off."),
+            IntentType.FLASHLIGHT_ON: (lambda: self.bridge.set_flashlight(True), "Torch turned on."), IntentType.FLASHLIGHT_OFF: (lambda: self.bridge.set_flashlight(False), "Torch turned off."),
             IntentType.BRIGHTNESS_UP: (lambda: self.bridge.adjust_brightness("up"), "Brightness increased."), IntentType.BRIGHTNESS_DOWN: (lambda: self.bridge.adjust_brightness("down"), "Brightness decreased."),
             IntentType.VOLUME_UP: (lambda: self.bridge.adjust_volume("up"), "Volume increased."), IntentType.VOLUME_DOWN: (lambda: self.bridge.adjust_volume("down"), "Volume decreased."), IntentType.VOLUME_MUTE: (lambda: self.bridge.adjust_volume("mute"), "Volume muted."),
-            IntentType.WIFI_ON: (lambda: self.bridge.set_wifi(True), "WiFi controls opened. Android requires you to change it there."), IntentType.WIFI_OFF: (lambda: self.bridge.set_wifi(False), "WiFi controls opened. Android requires you to change it there."),
-            IntentType.BLUETOOTH_ON: (lambda: self.bridge.set_bluetooth(True), "Bluetooth controls opened. Android requires you to change it there."), IntentType.BLUETOOTH_OFF: (lambda: self.bridge.set_bluetooth(False), "Bluetooth controls opened. Android requires you to change it there."),
-            IntentType.HOTSPOT_ON: (lambda: self.bridge.set_hotspot(True), "Hotspot controls opened. Android requires you to change it there."), IntentType.HOTSPOT_OFF: (lambda: self.bridge.set_hotspot(False), "Hotspot controls opened. Android requires you to change it there."),
+            IntentType.WIFI_ON: (lambda: self.bridge.set_wifi(True), "Wi‑Fi turned on."), IntentType.WIFI_OFF: (lambda: self.bridge.set_wifi(False), "Wi‑Fi turned off."),
+            IntentType.BLUETOOTH_ON: (lambda: self.bridge.set_bluetooth(True), "Bluetooth turned on."), IntentType.BLUETOOTH_OFF: (lambda: self.bridge.set_bluetooth(False), "Bluetooth turned off."),
+            IntentType.HOTSPOT_ON: (lambda: self.bridge.set_hotspot(True), "Hotspot turned on."), IntentType.HOTSPOT_OFF: (lambda: self.bridge.set_hotspot(False), "Hotspot turned off."),
             IntentType.OPEN_CAMERA: (lambda: self.bridge.open_application("camera"), "Camera opened."), IntentType.CLOSE_APP: (lambda: self.bridge.close_application(), "Application closed."),
         }
         if kind in actions:

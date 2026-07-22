@@ -107,7 +107,7 @@ try:
                     3: "Audio recording failed. Check microphone permission.",
                     5: "Speech recognition is busy. Please try again.",
                     6: "Speech recognition timed out. Please try again.",
-                    7: "No speech was recognised. Please try again.",
+                    7: "I did not catch that. Please say it again.",
                     9: "Microphone permission is required to start listening.",
                     13: "Offline speech recognition package is not installed. Please connect to the internet or download offline language data in Google settings."
                 }.get(code, f"Speech recognition stopped (error {code}).")
@@ -158,25 +158,36 @@ class AndroidNativeBridge:
         try:
             from jnius import autoclass  # type: ignore
 
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            PythonService = autoclass("org.kivy.android.PythonService")
             self._autoclass = autoclass
-            self._activity = PythonActivity.mActivity
+            self._activity = PythonService.mService
+            self.logger.info("Android bridge running from foreground service")
         except Exception:
-            # A python-for-android service has no PythonActivity, but it can
-            # still use a Service as an Android Context (notably for TTS).
-            try:
-                from jnius import autoclass  # type: ignore
-
-                PythonService = autoclass("org.kivy.android.PythonService")
-                self._autoclass = autoclass
-                self._activity = PythonService.mService
-                self.logger.info("Android bridge running from foreground service")
-            except Exception:
-                self.logger.info("Android bridge running in desktop fallback mode")
+            self.logger.info("Android bridge running in desktop fallback mode")
+        self._ensure_tts()
 
     @property
     def android_available(self) -> bool:
         return self._activity is not None and self._autoclass is not None
+
+    def _ensure_tts(self) -> None:
+        if not self.android_available or self._tts is not None:
+            return
+        try:
+            from android.runnable import run_on_ui_thread  # type: ignore
+
+            @run_on_ui_thread
+            def init_tts() -> None:
+                try:
+                    TextToSpeech = self._class("android.speech.tts.TextToSpeech")
+                    self._tts_listener = TtsInitListener(self)
+                    self._tts = TextToSpeech(self._activity, self._tts_listener)
+                except Exception as exc:
+                    self.logger.exception("Could not initialise Android TTS: %s", exc)
+
+            init_tts()
+        except Exception as exc:
+            self.logger.exception("Android TTS init failed: %s", exc)
 
     def has_permission(self, permission: str) -> bool:
         """Return whether an Android runtime permission has been granted."""
@@ -251,6 +262,7 @@ class AndroidNativeBridge:
         except Exception as exc:
             self.logger.exception("TTS diagnostic failed: %s", exc)
             return {"ok": False, "message": f"TTS test failed: {exc}"}
+
     def _speak_now(self, text: str, speech_speed: float) -> None:
         if self._tts is None or not self._tts_ready:
             return
@@ -269,10 +281,22 @@ class AndroidNativeBridge:
             return self._blink_torch()
         if mode == "vibrate" and self.android_available:
             return self._vibrate(180)
+        if mode == "sound" and self.android_available:
+            return self._play_tone()
         if mode == "screen_flash":
-            return self._set_window_brightness(100)
+            return self._flash_window_brightness(0.9, 0.25)
         self.logger.info("Wake signal requested: %s", mode)
         return True
+
+    def _play_tone(self) -> bool:
+        try:
+            ToneGenerator = self._class("android.media.ToneGenerator")
+            gen = ToneGenerator(1, 75)
+            gen.startTone(ToneGenerator.TONE_PROP_BEEP)
+            return True
+        except Exception as exc:
+            self.logger.exception("Android wake tone failed: %s", exc)
+            return False
 
     def call_number(self, phone_number: str) -> bool:
         if not self.android_available:
@@ -319,7 +343,10 @@ class AndroidNativeBridge:
                     return False
                 intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             else:
-                intent = self._activity.getPackageManager().getLaunchIntentForPackage(package_or_name)
+                resolved_package = self._resolve_package_name(package_or_name)
+                if not resolved_package:
+                    return False
+                intent = self._activity.getPackageManager().getLaunchIntentForPackage(resolved_package)
                 if intent is None:
                     return False
             self._activity.startActivity(intent)
@@ -381,15 +408,52 @@ class AndroidNativeBridge:
 
     def set_wifi(self, enabled: bool) -> bool:
         self.logger.info("WiFi change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.WIFI_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True
+        try:
+            if not self.request_permissions(["android.permission.CHANGE_WIFI_STATE"]).get("android.permission.CHANGE_WIFI_STATE"):
+                self.logger.warning("Change WiFi permission was not granted")
+                return False
+            Context = self._class("android.content.Context")
+            wifi = self._activity.getSystemService(Context.WIFI_SERVICE)
+            return bool(wifi.setWifiEnabled(enabled))
+        except Exception as exc:
+            self.logger.exception("Android WiFi toggle failed: %s", exc)
+            return self._open_settings_panel("android.settings.WIFI_SETTINGS")
 
     def set_hotspot(self, enabled: bool) -> bool:
         self.logger.info("Hotspot change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.WIRELESS_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True
+        try:
+            if not self.request_permissions(["android.permission.CHANGE_WIFI_STATE"]).get("android.permission.CHANGE_WIFI_STATE"):
+                self.logger.warning("Change WiFi permission was not granted")
+                return False
+            Context = self._class("android.content.Context")
+            wifi = self._activity.getSystemService(Context.WIFI_SERVICE)
+            if hasattr(wifi, "setWifiApEnabled"):
+                config = self._class("android.net.wifi.WifiConfiguration")()
+                return bool(wifi.setWifiApEnabled(config, enabled))
+        except Exception as exc:
+            self.logger.exception("Android hotspot toggle failed: %s", exc)
+        return self._open_settings_panel("android.settings.WIRELESS_SETTINGS")
 
     def set_bluetooth(self, enabled: bool) -> bool:
         self.logger.info("Bluetooth change requested: %s", enabled)
-        return self._open_settings_panel("android.settings.BLUETOOTH_SETTINGS") if self.android_available else True
+        if not self.android_available:
+            return True
+        try:
+            if not self.request_permissions(["android.permission.BLUETOOTH_CONNECT"]).get("android.permission.BLUETOOTH_CONNECT"):
+                self.logger.warning("Bluetooth connect permission was not granted")
+                return False
+            BluetoothAdapter = self._class("android.bluetooth.BluetoothAdapter")
+            adapter = BluetoothAdapter.getDefaultAdapter()
+            if adapter is None:
+                return self._open_settings_panel("android.settings.BLUETOOTH_SETTINGS")
+            return bool(adapter.setEnabled(enabled))
+        except Exception as exc:
+            self.logger.exception("Android Bluetooth toggle failed: %s", exc)
+            return self._open_settings_panel("android.settings.BLUETOOTH_SETTINGS")
 
     def set_brightness(self, percentage: int) -> bool:
         """Set device brightness after the user grants Android special access once."""
@@ -457,199 +521,91 @@ class AndroidNativeBridge:
         except Exception as exc:
             self.logger.exception("Android window brightness failed: %s", exc)
             return False
-    def get_battery_percentage(self) -> int:
-        if self.android_available:
-            try:
-                Intent = self._class("android.content.Intent")
-                IntentFilter = self._class("android.content.IntentFilter")
-                battery = self._activity.registerReceiver(None, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                level = battery.getIntExtra("level", -1)
-                scale = battery.getIntExtra("scale", -1)
-                if level >= 0 and scale > 0:
-                    return int(level * 100 / scale)
-            except Exception as exc:
-                self.logger.exception("Android battery read failed: %s", exc)
-        return 64
 
-    def list_contacts(self) -> list[dict[str, str]]:
-        """Return local phone contacts for offline fuzzy name resolution."""
+    def _flash_window_brightness(self, percentage: int = 0.9, duration_seconds: float = 0.25) -> bool:
         if not self.android_available:
-            return []
+            return True
         try:
-            permission = "android.permission.READ_CONTACTS"
-            if not self.request_permissions([permission]).get(permission):
-                self.logger.warning("Contacts permission was not granted")
-                return []
-            ContactsContract = self._class("android.provider.ContactsContract$CommonDataKinds$Phone")
-            cursor = self._activity.getContentResolver().query(
-                ContactsContract.CONTENT_URI, None, None, None, "display_name COLLATE NOCASE ASC"
-            )
-            contacts: list[dict[str, str]] = []
-            if cursor is None:
-                return contacts
-            name_index = cursor.getColumnIndex("display_name")
-            number_index = cursor.getColumnIndex("data1")
-            while cursor.moveToNext():
-                name = cursor.getString(name_index)
-                number = cursor.getString(number_index)
-                if name and number:
-                    contacts.append({"name": str(name), "phone_number": str(number)})
-            cursor.close()
-            return contacts
+            import time
+            from android.runnable import run_on_ui_thread  # type: ignore
+
+            completed = threading.Event()
+            result = {"success": False}
+
+            @run_on_ui_thread
+            def apply_flash() -> None:
+                try:
+                    window = self._activity.getWindow()
+                    attributes = window.getAttributes()
+                    attributes.screenBrightness = max(0.0, min(1.0, percentage / 100))
+                    window.setAttributes(attributes)
+                    result["success"] = True
+                except Exception as exc:
+                    self.logger.exception("Android wake flash failed: %s", exc)
+                finally:
+                    completed.set()
+
+            apply_flash()
+            completed.wait(timeout=2.0)
+            if result["success"]:
+                time.sleep(duration_seconds)
+                return self._restore_window_brightness()
+            return False
         except Exception as exc:
-            self.logger.exception("Android contacts lookup failed: %s", exc)
-            return []
-    def read_latest_sms(self) -> str:
-        if self.android_available:
-            try:
-                if not self.request_permissions(["android.permission.READ_SMS"]).get("android.permission.READ_SMS"):
-                    self.logger.warning("SMS read permission was not granted")
-                    return "SMS permission is required to read messages."
-                Uri = self._class("android.net.Uri")
-                cursor = self._activity.getContentResolver().query(
-                    Uri.parse("content://sms/inbox"),
-                    None,
-                    None,
-                    None,
-                    "date DESC",
-                )
-                if cursor and cursor.moveToFirst():
-                    body = cursor.getString(cursor.getColumnIndex("body"))
-                    cursor.close()
-                    return body
-            except Exception as exc:
-                self.logger.exception("Android SMS read failed: %s", exc)
-        return "No unread SMS messages."
+            self.logger.exception("Android wake flash failed: %s", exc)
+            return False
 
-    def read_notification(self, package_name: str | None = None) -> str:
-        if package_name:
-            return f"No unread notifications for {package_name}."
-        return "You have no unread notifications."
-
-    def start_listening(self, timeout_seconds: int = 5) -> dict[str, Any]:
-        """Run one short Android recognition session; the microphone is not kept open."""
-        if not self.android_available:
-            return {"started": False, "status": "unavailable", "message": "Speech recognition is available on Android only."}
+    def _restore_window_brightness(self) -> bool:
         try:
             from android.runnable import run_on_ui_thread  # type: ignore
-            microphone = "android.permission.RECORD_AUDIO"
-            if not self.request_permissions([microphone]).get(microphone):
-                return {"started": False, "status": "permission_denied", "message": "Microphone permission is required to start listening."}
+
+            completed = threading.Event()
+            result = {"success": False}
+
             @run_on_ui_thread
-            def begin() -> None:
-                SpeechRecognizer = self._class("android.speech.SpeechRecognizer")
-                RecognizerIntent = self._class("android.speech.RecognizerIntent")
-                Intent = self._class("android.content.Intent")
-                if not SpeechRecognizer.isRecognitionAvailable(self._activity):
-                    with self._speech_lock:
-                        self._speech_state = "error"
-                        self._speech_error = "Speech recognition is not available on this phone."
-                    return
-                if self._speech_recognizer is not None:
-                    self._speech_recognizer.destroy()
-                self._speech_listener = SpeechRecognitionListener(self)
-                self._speech_recognizer = SpeechRecognizer.createSpeechRecognizer(self._activity)
-                self._speech_recognizer.setRecognitionListener(self._speech_listener)
-                intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, max(2, min(15, timeout_seconds)) * 1000)
-                self._speech_recognizer.startListening(intent)
-            with self._speech_lock:
-                self._speech_result, self._speech_error = None, None
-                self._speech_state = "starting"
-            begin()
-            def fail_if_not_ready() -> None:
-                with self._speech_lock:
-                    if self._speech_state != "starting":
-                        return
-                    self._speech_state = "error"
-                    self._speech_error = "Android did not initialize speech recognition. Check the phone speech service and try again."
-                self.logger.error("Speech recognizer never reached onReadyForSpeech")
-            threading.Timer(4.0, fail_if_not_ready).start()
-            return {"started": True, "status": "starting"}
+            def apply_restore() -> None:
+                try:
+                    window = self._activity.getWindow()
+                    attributes = window.getAttributes()
+                    attributes.screenBrightness = -1.0
+                    window.setAttributes(attributes)
+                    result["success"] = True
+                except Exception as exc:
+                    self.logger.exception("Android window brightness restore failed: %s", exc)
+                finally:
+                    completed.set()
+
+            apply_restore()
+            completed.wait(timeout=2.0)
+            return bool(result["success"])
         except Exception as exc:
-            self.logger.exception("Could not start speech recognition: %s", exc)
-            return {"started": False, "status": "error", "message": "Could not start speech recognition."}
-
-    def start_offline_listener(self) -> dict[str, Any]:
-        """Start the bundled Vosk foreground service from the visible activity."""
-        if not self.android_available:
-            return {"started": False, "status": "unavailable", "message": "Offline listening is available on Android only."}
-        microphone = "android.permission.RECORD_AUDIO"
-        if not self.request_permissions([microphone]).get(microphone):
-            return {"started": False, "status": "permission_denied", "message": "Microphone permission is required."}
-        try:
-            from pathlib import Path
-            stop_marker = Path(str(self._activity.getFilesDir().getAbsolutePath())) / "offline_listener.stop"
-            stop_marker.unlink(missing_ok=True)
-
-            try:
-                from jnius import autoclass
-                package_name = self._activity.getPackageName()
-                ServiceClass = autoclass(f"{package_name}.ServiceListener")
-                if hasattr(ServiceClass, "start"):
-                    ServiceClass.start(self._activity, "")
-            except Exception as service_exc:
-                self.logger.warning("Android service launcher fallback: %s", service_exc)
-
-            return {"started": True, "status": "starting", "message": "Background assistant is starting."}
-        except Exception as exc:
-            self.logger.exception("Could not start offline listener: %s", exc)
-            return {"started": False, "status": "error", "message": f"Could not start offline listening: {exc}"}
-
-    def stop_offline_listener(self) -> dict[str, Any]:
-        if not self.android_available:
-            return {"stopped": True, "status": "unavailable"}
-        try:
-            from pathlib import Path
-            Path(str(self._activity.getFilesDir().getAbsolutePath()), "offline_listener.stop").touch()
-            return {"stopped": True, "status": "stopping", "message": "Offline listener is stopping."}
-        except Exception as exc:
-            self.logger.exception("Could not stop offline listener: %s", exc)
-            return {"stopped": False, "status": "error", "message": "Could not stop offline listening."}
-    def consume_speech_result(self) -> dict[str, str]:
-        with self._speech_lock:
-            if self._speech_result is not None:
-                value, self._speech_result = self._speech_result, None
-                self._speech_state = "idle"
-                return {"status": "result", "transcript": value}
-            if self._speech_error is not None:
-                value, self._speech_error = self._speech_error, None
-                self._speech_state = "idle"
-                return {"status": "error", "message": value}
-            return {"status": self._speech_state}
-
-    def open_airplane_mode_settings(self) -> bool:
-        return self._open_settings_panel("android.settings.AIRPLANE_MODE_SETTINGS") if self.android_available else True
-    def _class(self, name: str) -> Any:
-        if not self._autoclass:
-            raise RuntimeError("Android runtime is unavailable")
-        return self._autoclass(name)
-
-    def _open_settings_panel(self, action: str) -> bool:
-        try:
-            Intent = self._class("android.content.Intent")
-            self._activity.startActivity(Intent(action))
-            return True
-        except Exception as exc:
-            self.logger.exception("Android settings panel failed: %s", exc)
+            self.logger.exception("Android window brightness restore failed: %s", exc)
             return False
 
-    def _blink_torch(self) -> bool:
-        import time
-
-        if not self.set_flashlight(True):
-            return False
-        time.sleep(0.15)
-        return self.set_flashlight(False)
-
-    def _vibrate(self, milliseconds: int) -> bool:
-        try:
-            Context = self._class("android.content.Context")
-            vibrator = self._activity.getSystemService(Context.VIBRATOR_SERVICE)
-            vibrator.vibrate(milliseconds)
-            return True
-        except Exception as exc:
-            self.logger.exception("Android vibration failed: %s", exc)
-            return False
+    def _resolve_package_name(self, package_or_name: str) -> str | None:
+        if not package_or_name:
+            return None
+        normalized = package_or_name.strip().lower().replace(" ", "")
+        known = {
+            "whatsapp": "com.whatsapp",
+            "instagram": "com.instagram.android",
+            "facebook": "com.facebook.katana",
+            "youtube": "com.google.android.youtube",
+            "chrome": "com.android.chrome",
+            "maps": "com.google.android.apps.maps",
+            "gmail": "com.google.android.gm",
+            "messages": "com.google.android.apps.messaging",
+            "clock": "com.google.android.deskclock",
+            "camera": "camera",
+            "photos": "com.google.android.apps.photos",
+            "music": "com.google.android.music",
+            "settings": "android.settings.SETTINGS",
+        }
+        best_match = known.get(normalized)
+        if best_match:
+            return best_match
+        for candidate, package in known.items():
+            if candidate.startswith(normalized) or normalized.startswith(candidate):
+                return package
+        return None
 

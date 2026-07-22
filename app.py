@@ -41,7 +41,7 @@ class UserSettings:
     speech_speed: float = 1.0
     wake_word: str = "phone"
     wake_timeout_seconds: int = 5
-    wake_feedback_mode: str = "screen_flash"
+    wake_feedback_mode: str = "vibrate"
     confirm_before_call: bool = False
     confirm_before_message: bool = True
     voice_profile_enabled: bool = True
