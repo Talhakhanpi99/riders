@@ -25,7 +25,9 @@ android.private_storage = True
 # Required because the Android WebView loads the local Flask server over http://127.0.0.1.
 # This is inserted as attributes of AndroidManifest.xml's <application> element.
 android.extra_manifest_application_arguments = android/manifest_application_arguments.xml
-android.add_aars = %(source.dir)s/android/libs/vosk-android-0.3.32.aar
+# Resolve the Vosk Java runtime through Gradle so the generated Android project
+# can satisfy ':debugRuntimeClasspath' during the AAR metadata check.
+android.gradle_dependencies = com.alphacephei:vosk-android:0.3.32
 android.add_libs_arm64_v8a = %(source.dir)s/android/libs/arm64-v8a/libvosk.so
 android.add_assets = android/assets/vosk-model-small-en-us-0.15:model-en-us
 android.enable_androidx = True
