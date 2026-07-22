@@ -12,8 +12,4 @@ bin/
 *.aab
 .env
 venv-broken/
-android/libs/*.aar
-android/libs/*.zip
-android/libs/arm64-v8a/*.so
-android/libs/vosk-aar-inspect/
 

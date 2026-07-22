@@ -1,9 +1,14 @@
 const form = document.querySelector("#settingsForm");
 const permissionsList = document.querySelector("#permissionsList");
 
+function applyTheme(theme = "dark") {
+  document.body.dataset.theme = theme === "light" ? "light" : "dark";
+}
+
 async function loadSettings() {
   const response = await fetch("/api/settings");
   const settings = await response.json();
+  applyTheme(settings.theme);
   Object.entries(settings).forEach(([key, value]) => {
     const field = form.elements[key];
     if (!field) return;
@@ -16,6 +21,7 @@ async function loadSettings() {
 }
 
 async function loadPermissions() {
+  if (!permissionsList) return;
   const response = await fetch("/api/permissions");
   const permissions = await response.json();
   permissionsList.innerHTML = permissions

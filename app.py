@@ -1,4 +1,4 @@
-"""Flask application, database, settings, routes, and dependency wiring."""
+﻿"""Flask application, database, settings, routes, and dependency wiring."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from typing import Any
 
 from flask import Flask, jsonify, render_template, request
 
-from diag_log import log
 from platform_bridge import AndroidNativeBridge
 from voice_core import AssistantService, PermissionManager
 
@@ -74,7 +73,6 @@ def configure_logging() -> logging.Logger:
     stream_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
-    log("STARTUP", "Logging configured | level=%s | log_dir=%s", settings.log_level, settings.log_dir)
     return logger
 
 
@@ -277,7 +275,6 @@ def create_app() -> Flask:
     contacts_repository = ContactsRepository(database)
     settings_service = SettingsService(settings_repository)
     bridge = AndroidNativeBridge(logger)
-    log("STARTUP", "AndroidNativeBridge created | android_available=%s", bridge.android_available)
     assistant = AssistantService(
         bridge=bridge,
         history=history_repository,
@@ -319,20 +316,15 @@ def register_routes(
                 "app": "VoiceRide",
                 "android_available": bridge.android_available,
                 "settings": asdict(settings_service.get()),
-                "last_transcript": assistant.last_transcript,
-                "last_response": assistant.last_response,
-                "last_update_id": assistant.last_update_id,
             }
         )
 
     @flask_app.post("/api/command")
     def command() -> Any:
         payload = request.get_json(silent=True) or {}
-        text = str(payload.get("text", ""))
-        log("API", "POST /api/command text=%r", text[:80])
         return jsonify(
             assistant.handle_text(
-                text,
+                str(payload.get("text", "")),
                 require_wake_word=bool(payload.get("require_wake_word", False)),
             )
         )
@@ -341,9 +333,7 @@ def register_routes(
     def start_listening() -> Any:
         payload = request.get_json(silent=True) or {}
         timeout = max(2, min(15, int(payload.get("timeout_seconds", settings_service.get().wake_timeout_seconds))))
-        result = bridge.start_listening(timeout)
-        log("API", "POST /api/listen/start timeout=%s -> %s", timeout, result.get("status"))
-        return jsonify(result)
+        return jsonify(bridge.start_listening(timeout))
 
     @flask_app.get("/api/listen/result")
     def listening_result() -> Any:
@@ -375,21 +365,17 @@ def register_routes(
             bridge.signal_wake(user_settings.wake_feedback_mode)
             bridge.speak("Yes, I am here.", user_settings.speech_speed)
             return jsonify({"status": "wake_detected", "transcript": transcript, "response": "Yes, I am here."})
-        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up(), is_offline_service=True)
+        result = assistant.handle_text(transcript, require_wake_word=not assistant.consume_follow_up())
         result.update({"status": "completed", "transcript": transcript})
         return jsonify(result)
 
     @flask_app.post("/api/offline-listener/start")
     def start_offline_listener() -> Any:
-        result = bridge.start_offline_listener()
-        log("API", "POST /api/offline-listener/start -> %s", result.get("status"))
-        return jsonify(result)
+        return jsonify(bridge.start_offline_listener())
 
     @flask_app.post("/api/offline-listener/stop")
     def stop_offline_listener() -> Any:
-        result = bridge.stop_offline_listener()
-        log("API", "POST /api/offline-listener/stop -> %s", result.get("status"))
-        return jsonify(result)
+        return jsonify(bridge.stop_offline_listener())
     @flask_app.get("/api/settings")
     def get_settings() -> Any:
         return jsonify(asdict(settings_service.get()))
@@ -464,12 +450,5 @@ def register_routes(
             "settings": asdict(settings_service.get()),
             "recent_commands": history_repository.recent_commands(),
         })
-
-    @flask_app.get("/api/diagnostics/runtime")
-    def runtime_diagnostics() -> Any:
-        """Live subsystem state for adb logcat correlation."""
-        snapshot = bridge.runtime_snapshot()
-        log("DIAG", "Runtime snapshot requested: vosk=%s tts_ready=%s", snapshot.get("vosk_status"), snapshot.get("tts_ready"))
-        return jsonify(snapshot)
 
 
